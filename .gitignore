@@ -139,3 +139,5 @@ temp/
 *.bak
 *.tex
 *.txt
+!requirements.txt
+!requirements-docker.txt

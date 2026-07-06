@@ -1,0 +1,13 @@
+transformers==4.57.1
+diffusers
+accelerate
+einops
+numpy
+pillow
+tqdm
+scipy
+flask
+openai
+python-dotenv
+huggingface_hub[cli]
+boto3
