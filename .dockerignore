@@ -1,0 +1,7 @@
+models-cache/
+outputs-o1/
+__pycache__/
+.git/
+.env
+.env.*
+*.pyc

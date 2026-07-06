@@ -93,6 +93,7 @@ checkpoints/
 weights/
 pretrained/
 models_cache/
+models-cache/
 .cache/
 .hf_cache/
 huggingface/

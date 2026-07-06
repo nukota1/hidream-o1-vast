@@ -20,7 +20,10 @@ import os
 import queue
 import tempfile
 import threading
+import urllib.error
+import urllib.request
 import uuid
+from datetime import datetime, timezone
 
 import torch
 from dotenv import load_dotenv
@@ -51,6 +54,32 @@ _STATE = {
 }
 _JOBS = {}
 
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://host.docker.internal:11434").rstrip("/")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.5:9b")
+AUTO_PROMPT_OPTIMIZE = os.environ.get("AUTO_PROMPT_OPTIMIZE", "1").lower() not in {
+    "0", "false", "no", "off"
+}
+
+O1_PROMPT_OPTIMIZER_SYSTEM = """
+You are a prompt director for HiDream-O1-Image-Dev.
+Your job is to convert the user's request, in any language, into one clear English
+image-generation prompt that HiDream-O1 can follow.
+
+Rules:
+- Preserve the user's intent, subject, composition, clothing, colors, mood, and location.
+- Do not invent unrelated places, props, seasons, clothing, species, brands, text, or logos.
+- If the user asks for anime, manga, bishoujo game, visual novel, game CG, or illustration,
+  make the style explicit: "2D Japanese visual novel game CG illustration, not photorealistic,
+  not a real-life photo".
+- If the user asks for photo/realistic, keep it photographic. Otherwise choose the style implied
+  by the user's wording and keep it explicit.
+- Convert abstract or Japanese-specific terms into visible English visual details.
+- Turn long bullet lists into a natural, dense single paragraph.
+- Keep fine character details, camera direction, pose, weather, background, and material details.
+- For O1, use direct visual language and avoid tag soup.
+- Output JSON only, with keys "prompt" and "intent_notes".
+""".strip()
+
 
 def _add_special_tokens(tokenizer):
     tokenizer.boi_token = "<|boi_token|>"
@@ -70,12 +99,273 @@ def _get_tokenizer(processor):
 def load_image_model(model_path):
     print(f"[app] Loading checkpoint from {model_path} ...")
     processor = AutoProcessor.from_pretrained(model_path)
+    dtype_name = os.environ.get("HIDREAM_TORCH_DTYPE", "auto").lower()
+    if dtype_name == "auto":
+        device_name = torch.cuda.get_device_name(0).lower() if torch.cuda.is_available() else ""
+        dtype_name = "float16" if "v100" in device_name or "tesla v100" in device_name else "bfloat16"
+    dtype = {
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "fp32": torch.float32,
+        "float32": torch.float32,
+    }.get(dtype_name)
+    if dtype is None:
+        raise ValueError(f"Unsupported HIDREAM_TORCH_DTYPE: {dtype_name}")
+    print(f"[app] Using torch dtype: {dtype}")
     # NOTE: torch_dtype = torch.float32 will generate more detailed images but with more memory usage
     model = Qwen3VLForConditionalGeneration.from_pretrained(
-        model_path, torch_dtype=torch.bfloat16, device_map="cuda"
+        model_path, torch_dtype=dtype, device_map="cuda"
     ).eval()
     _add_special_tokens(_get_tokenizer(processor))
     return processor, model
+
+
+def strip_thinking(text):
+    while "<think>" in text and "</think>" in text:
+        before, rest = text.split("<think>", 1)
+        _, after = rest.split("</think>", 1)
+        text = before + after
+    return text.strip()
+
+
+def parse_json_object(text):
+    text = strip_thinking(text)
+    if "```" in text:
+        parts = text.split("```")
+        for part in parts:
+            candidate = part.strip()
+            if candidate.startswith("json"):
+                candidate = candidate[4:].strip()
+            if candidate.startswith("{") and candidate.endswith("}"):
+                return json.loads(candidate)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        return json.loads(text[start:end + 1])
+    raise ValueError("No JSON object found in optimizer output.")
+
+
+def fallback_o1_prompt(user_prompt):
+    return (
+        "Create a 2D Japanese visual novel game CG illustration, not photorealistic, "
+        "not a real-life photo. Follow the user's request exactly and preserve every "
+        "character, clothing, pose, weather, background, color, and material detail. "
+        "Render clean anime line art, expressive eyes, detailed hair, crisp character "
+        "design, and a coherent composition. User request: "
+        + user_prompt.replace("\n", " ")
+    )
+
+
+def clamp_int(value, default=50, low=0, high=100):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(low, min(high, parsed))
+
+
+def normalize_style_settings(settings):
+    settings = settings or {}
+    return {
+        "anime_strength": clamp_int(settings.get("anime_strength"), 80),
+        "line_detail": clamp_int(settings.get("line_detail"), 70),
+        "color_vividness": clamp_int(settings.get("color_vividness"), 65),
+        "background_mood": clamp_int(settings.get("background_mood"), 60),
+        "photoreal_avoidance": clamp_int(settings.get("photoreal_avoidance"), 85),
+    }
+
+
+def describe_style_settings(settings):
+    settings = normalize_style_settings(settings)
+    return (
+        "User style preference sliders, 0 to 100:\n"
+        f"- Anime / visual novel style strength: {settings['anime_strength']}\n"
+        f"- Clean line art and fine detail strength: {settings['line_detail']}\n"
+        f"- Vivid color and eye-catching rendering strength: {settings['color_vividness']}\n"
+        f"- Nostalgic / atmospheric background strength: {settings['background_mood']}\n"
+        f"- Avoid photorealism and live-action photography strength: {settings['photoreal_avoidance']}\n"
+        "Reflect these preferences in the English prompt without contradicting the user's requested content."
+    )
+
+
+def post_ollama_chat(messages, timeout=180):
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": messages,
+        "stream": False,
+        "think": False,
+        "options": {
+            "temperature": 0.0,
+            "num_predict": 1400,
+        },
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}/api/chat",
+        data=data,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def post_openai_compatible_chat(messages, timeout=180):
+    base_url = os.environ.get("OPENAI_BASE_URL", "").rstrip("/")
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    model_name = os.environ.get("OPENAI_MODEL", "")
+    if not all([base_url, api_key, model_name]):
+        raise RuntimeError("OpenAI-compatible prompt optimizer is not configured.")
+
+    payload = {
+        "model": model_name,
+        "messages": messages,
+        "temperature": 0,
+        "max_tokens": 1400,
+        "response_format": {"type": "json_object"},
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url}/chat/completions",
+        data=data,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": f"Bearer {api_key}",
+            "HTTP-Referer": "http://127.0.0.1:7861",
+            "X-Title": "HiDream-O1 Local Prompt Refiner",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def parse_chat_completion(result):
+    choices = result.get("choices") or []
+    if not choices:
+        raise ValueError("No choices returned from prompt optimizer.")
+    return choices[0].get("message", {}).get("content", "")
+
+
+def optimize_prompt_for_o1(user_prompt, mode="t2i", style_settings=None):
+    if not AUTO_PROMPT_OPTIMIZE:
+        return {
+            "prompt": user_prompt,
+            "intent_notes": "Automatic O1 prompt optimization is disabled.",
+            "source": "disabled",
+        }
+
+    user_message = (
+        f"Mode: {mode}\n"
+        "Rewrite the following request for HiDream-O1-Image. "
+        "Respect the user's intended art style and visual priorities.\n\n"
+        f"{describe_style_settings(style_settings)}\n\n"
+        f"{user_prompt}"
+    )
+    try:
+        result = post_openai_compatible_chat(
+            [
+                {"role": "system", "content": O1_PROMPT_OPTIMIZER_SYSTEM},
+                {"role": "user", "content": user_message},
+            ]
+        )
+        raw = parse_chat_completion(result)
+        parsed = parse_json_object(raw)
+        optimized = str(parsed.get("prompt", "")).strip()
+        if len(optimized) < 40:
+            raise ValueError("Optimizer returned a prompt that is too short.")
+        return {
+            "prompt": optimized,
+            "intent_notes": str(parsed.get("intent_notes", "")).strip(),
+            "source": os.environ.get("OPENAI_MODEL", "openai-compatible"),
+        }
+    except Exception as api_exc:
+        print(f"[prompt] OpenAI-compatible optimization failed, falling back to Ollama: {api_exc}")
+    try:
+        result = post_ollama_chat(
+            [
+                {"role": "system", "content": O1_PROMPT_OPTIMIZER_SYSTEM},
+                {"role": "user", "content": user_message},
+            ]
+        )
+        raw = result.get("message", {}).get("content", "")
+        parsed = parse_json_object(raw)
+        optimized = str(parsed.get("prompt", "")).strip()
+        if len(optimized) < 40:
+            raise ValueError("Optimizer returned a prompt that is too short.")
+        return {
+            "prompt": optimized,
+            "intent_notes": str(parsed.get("intent_notes", "")).strip(),
+            "source": "ollama",
+        }
+    except Exception as exc:
+        print(f"[prompt] O1 prompt optimization failed: {exc}")
+        return {
+            "prompt": fallback_o1_prompt(user_prompt),
+            "intent_notes": f"Fallback prompt wrapper used because optimization failed: {exc}",
+            "source": "fallback",
+        }
+
+
+def get_r2_client():
+    endpoint_url = os.environ.get("R2_ENDPOINT_URL", "").rstrip("/")
+    access_key = os.environ.get("R2_ACCESS_KEY_ID", "")
+    secret_key = os.environ.get("R2_SECRET_ACCESS_KEY", "")
+    if not all([endpoint_url, access_key, secret_key]):
+        raise RuntimeError("R2 storage is not configured.")
+
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name="auto",
+        config=Config(signature_version="s3v4"),
+    )
+
+
+def save_image_to_r2(image_b64, metadata):
+    bucket = os.environ.get("R2_BUCKET", "")
+    if not bucket:
+        raise RuntimeError("R2_BUCKET is not configured.")
+
+    image_bytes = base64.b64decode(image_b64)
+    now = datetime.now(timezone.utc)
+    image_id = uuid.uuid4().hex
+    prefix = f"generated/{now:%Y/%m/%d}/{image_id}"
+    image_key = f"{prefix}.png"
+    metadata_key = f"{prefix}.json"
+    metadata = {
+        **(metadata or {}),
+        "saved_at": now.isoformat(),
+        "image_key": image_key,
+        "metadata_key": metadata_key,
+    }
+
+    client = get_r2_client()
+    client.put_object(
+        Bucket=bucket,
+        Key=image_key,
+        Body=image_bytes,
+        ContentType="image/png",
+    )
+    client.put_object(
+        Bucket=bucket,
+        Key=metadata_key,
+        Body=json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8"),
+        ContentType="application/json; charset=utf-8",
+    )
+    return {
+        "bucket": bucket,
+        "image_key": image_key,
+        "metadata_key": metadata_key,
+        "endpoint": os.environ.get("R2_ENDPOINT_URL", ""),
+    }
 
 
 # ── HTML ─────────────────────────────────────────────────────────────────────
@@ -363,6 +653,30 @@ INDEX_HTML = r"""<!doctype html>
     font-size: 12px; color: var(--muted);
     font-feature-settings: "tnum";
   }
+  .process-list {
+    width: 100%; max-width: 520px; margin-top: 14px;
+    display: grid; gap: 8px;
+  }
+  .process-step {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 11px; border: 1px solid var(--border);
+    border-radius: var(--radius-sm); background: var(--panel);
+    color: var(--muted); font-size: 12.5px;
+  }
+  .process-dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--border-strong); flex: 0 0 auto;
+  }
+  .process-step.active {
+    color: var(--text); border-color: rgba(0, 113, 227, 0.45);
+    background: rgba(0, 113, 227, 0.04);
+  }
+  .process-step.active .process-dot {
+    background: var(--blue);
+    box-shadow: 0 0 0 4px rgba(0, 113, 227, 0.12);
+  }
+  .process-step.done { color: var(--text); }
+  .process-step.done .process-dot { background: var(--mint); }
   .progress-bar {
     width: 100%; max-width: 520px; height: 3px; border-radius: 999px;
     background: var(--panel-2); overflow: hidden; margin-top: 10px;
@@ -391,6 +705,19 @@ INDEX_HTML = r"""<!doctype html>
   }
   .refine-actions { display: flex; gap: 8px; margin-top: 10px; }
   .refine-actions button { flex: 1; padding: 7px 10px; font-size: 12px; }
+  .range-row {
+    display: grid; grid-template-columns: 1fr auto; gap: 10px;
+    align-items: center; margin-bottom: 14px;
+  }
+  .range-row label { margin: 0; }
+  .range-row .value {
+    color: var(--muted); font-size: 12px; min-width: 32px;
+    text-align: right; font-variant-numeric: tabular-nums;
+  }
+  input[type="range"] {
+    grid-column: 1 / -1; width: 100%; accent-color: var(--blue);
+    padding: 0; border: none; background: transparent;
+  }
   .err {
     color: var(--danger); margin-top: 12px; font-size: 12.5px;
     padding: 8px 12px; background: rgba(215, 0, 21, 0.06);
@@ -434,77 +761,106 @@ INDEX_HTML = r"""<!doctype html>
   <div class="layout">
     <aside class="sidebar">
       <div class="tabs" id="tabs">
-        <div class="tab active" data-mode="t2i">Text → Image</div>
-        <div class="tab" data-mode="edit">Edit</div>
-        <div class="tab" data-mode="subject">Subject</div>
+        <div class="tab active" data-mode="t2i">テキスト生成</div>
+        <div class="tab" data-mode="edit">画像編集</div>
+        <div class="tab" data-mode="subject">参照生成</div>
       </div>
 
       <div class="group">
-        <label>Prompt</label>
-        <textarea id="prompt" placeholder="Describe the image you want to create..."></textarea>
+        <label>プロンプト</label>
+        <textarea id="prompt" placeholder="描きたい内容を日本語で入力してください"></textarea>
       </div>
 
       <div class="group" id="refs-group" style="display:none">
-        <label id="refs-label">Reference image</label>
+        <label id="refs-label">参照画像</label>
         <label class="file-input">
           <input id="refs" type="file" accept="image/*" multiple />
-          <span>Click to upload images</span>
+          <span>画像を選択</span>
         </label>
         <div class="thumbs" id="thumbs"></div>
         <label id="keep-aspect-row" style="display:none; margin-top:10px; font-weight:400; text-transform:none; letter-spacing:0; cursor:pointer;">
           <input id="keep-aspect" type="checkbox" style="vertical-align:middle; margin-right:6px;" />
-          Keep reference aspect (resize to 2048)
+          参照画像の縦横比を維持する
         </label>
         <div id="edit-scheduler-row" style="display:none; margin-top:12px;">
-          <label>Scheduler</label>
+          <label>スケジューラー</label>
           <select id="edit-scheduler">
-            <option value="flow_match" selected>flow_match (default)</option>
+            <option value="flow_match" selected>flow_match（標準）</option>
             <option value="flash">flash</option>
           </select>
         </div>
       </div>
 
+      <details open>
+        <summary>画風調整</summary>
+        <div class="range-row">
+          <label for="anime-strength">アニメ・美少女ゲーム風</label>
+          <span class="value" id="anime-strength-value">80</span>
+          <input id="anime-strength" type="range" min="0" max="100" value="80" />
+        </div>
+        <div class="range-row">
+          <label for="line-detail">線画・描き込み</label>
+          <span class="value" id="line-detail-value">70</span>
+          <input id="line-detail" type="range" min="0" max="100" value="70" />
+        </div>
+        <div class="range-row">
+          <label for="color-vividness">色の鮮やかさ</label>
+          <span class="value" id="color-vividness-value">65</span>
+          <input id="color-vividness" type="range" min="0" max="100" value="65" />
+        </div>
+        <div class="range-row">
+          <label for="background-mood">背景の雰囲気</label>
+          <span class="value" id="background-mood-value">60</span>
+          <input id="background-mood" type="range" min="0" max="100" value="60" />
+        </div>
+        <div class="range-row">
+          <label for="photoreal-avoidance">実写化を避ける強さ</label>
+          <span class="value" id="photoreal-avoidance-value">85</span>
+          <input id="photoreal-avoidance" type="range" min="0" max="100" value="85" />
+        </div>
+      </details>
+
       <details id="refine-section">
-        <summary>Prompt Refiner</summary>
-        <label>Backend</label>
+        <summary>プロンプト調整</summary>
+        <label>処理方式</label>
         <select id="refine-backend">
-          <option value="api">OpenAI-compatible API</option>
-          <option value="local">Local · Gemma</option>
+          <option value="api">OpenRouter / Gemma</option>
+          <option value="local">ローカル Gemma</option>
         </select>
         <div id="api-fields" style="margin-top: 12px">
           <label>Base URL</label>
           <input id="api-base" type="text" autocomplete="off" name="hd-base-url"
                  placeholder="https://api.openai.com/v1" value="{{ env_base_url }}" />
-          <label style="margin-top:10px">API Key</label>
+          <label style="margin-top:10px">APIキー</label>
           <input id="api-key" type="password" autocomplete="new-password" name="hd-api-key"
-                 placeholder="sk-..." value="{{ env_api_key }}" />
-          <label style="margin-top:10px">Model</label>
+                 placeholder="サーバー設定済み。空欄のままで利用できます" value="" />
+          <label style="margin-top:10px">モデル</label>
           <input id="api-model" type="text" autocomplete="off" name="hd-model"
                  placeholder="gpt-4o-mini" value="{{ env_model }}" />
         </div>
         <button class="btn-secondary" id="refine-btn" style="margin-top: 14px; margin-bottom: 0">
-          Refine Prompt
+          プロンプトを調整
         </button>
         <div id="refine-preview" class="refine-preview" style="display:none"></div>
       </details>
 
       <details>
-        <summary>Generation Settings</summary>
+        <summary>生成設定</summary>
         <div class="row" style="margin-bottom: 12px">
           <div>
-            <label>Width</label>
+            <label>幅</label>
             <input id="width" type="number" value="2048" step="64" min="512" />
           </div>
           <div>
-            <label>Height</label>
+            <label>高さ</label>
             <input id="height" type="number" value="2048" step="64" min="512" />
           </div>
         </div>
-        <label>Seed</label>
+        <label>シード</label>
         <input id="seed" type="number" value="32" />
       </details>
 
-      <button class="btn-primary" id="go">Generate</button>
+      <button class="btn-primary" id="go">生成する</button>
       <div class="err" id="err" style="display:none"></div>
     </aside>
 
@@ -512,7 +868,7 @@ INDEX_HTML = r"""<!doctype html>
       <div class="canvas-empty" id="empty">
         <div style="text-align: center">
           <div style="font-size: 32px; opacity: 0.3; margin-bottom: 8px">◍</div>
-          <div>Your generated image will appear here</div>
+          <div>生成した画像がここに表示されます</div>
         </div>
       </div>
       <div class="progress" id="progress" style="display:none">
@@ -520,8 +876,14 @@ INDEX_HTML = r"""<!doctype html>
           <img id="progress-img" style="display:none" />
         </div>
         <div class="progress-meta">
-          <span class="progress-label" id="progress-text">Preparing</span>
+          <span class="progress-label" id="progress-text">準備中</span>
           <span class="progress-step" id="progress-sub">—</span>
+        </div>
+        <div class="process-list" id="process-list">
+          <div class="process-step" data-step="refine"><span class="process-dot"></span><span>日本語プロンプトを解析して英語化</span></div>
+          <div class="process-step" data-step="handoff"><span class="process-dot"></span><span>最適化プロンプトをHiDream-O1へ送信</span></div>
+          <div class="process-step" data-step="generate"><span class="process-dot"></span><span>画像を生成</span></div>
+          <div class="process-step" data-step="done"><span class="process-dot"></span><span>結果をウェブ画面へ返却</span></div>
         </div>
         <div class="progress-bar"><div class="progress-bar-fill" id="progress-fill"></div></div>
       </div>
@@ -529,6 +891,14 @@ INDEX_HTML = r"""<!doctype html>
         <img id="img" />
       </div>
       <div class="meta" id="meta" style="display:none"></div>
+      <div class="meta" id="after-actions" style="display:none">
+        <button class="btn-secondary" id="save-r2-btn" style="margin-bottom: 12px">R2に画像を保存</button>
+        <div id="save-r2-result" style="color:var(--muted); font-size:12.5px; margin-bottom:14px"></div>
+        <div class="label">AIに修正を依頼</div>
+        <textarea id="edit-prompt" placeholder="例：表情を少し笑顔にして、背景の雨を強くしてください"></textarea>
+        <button class="btn-primary" id="edit-go" style="margin-top: 12px">この画像を修正する</button>
+        <div id="edit-chat" style="margin-top:12px; color:var(--muted); font-size:12.5px"></div>
+      </div>
     </main>
   </div>
 
@@ -539,6 +909,41 @@ let mode = "t2i";
 let refFiles = [];
 let lastRefined = null;
 let originalPrompt = null;
+let lastImageB64 = "";
+let lastOriginalPrompt = "";
+let lastOptimizedPrompt = "";
+let lastOptimizerSource = "";
+
+const styleControls = [
+  ["anime-strength", "anime_strength"],
+  ["line-detail", "line_detail"],
+  ["color-vividness", "color_vividness"],
+  ["background-mood", "background_mood"],
+  ["photoreal-avoidance", "photoreal_avoidance"],
+];
+
+function syncStyleControl(id) {
+  const input = $(id);
+  const value = $(id + "-value");
+  if (input && value) value.textContent = input.value;
+}
+
+function getStyleSettings() {
+  const settings = {};
+  styleControls.forEach(([id, key]) => {
+    const input = $(id);
+    settings[key] = input ? parseInt(input.value) : 50;
+  });
+  return settings;
+}
+
+styleControls.forEach(([id]) => {
+  const input = $(id);
+  if (input) {
+    syncStyleControl(id);
+    input.oninput = () => syncStyleControl(id);
+  }
+});
 
 
 document.querySelectorAll(".tab").forEach((t) => {
@@ -612,6 +1017,17 @@ function fileToB64(f) {
 
 function showErr(msg) {
   const e = $("err"); e.textContent = msg; e.style.display = msg ? "" : "none";
+}
+
+function setProcessStep(activeStep) {
+  const order = ["refine", "handoff", "generate", "done"];
+  const activeIndex = order.indexOf(activeStep);
+  document.querySelectorAll(".process-step").forEach((el) => {
+    const step = el.dataset.step;
+    const idx = order.indexOf(step);
+    el.classList.toggle("active", step === activeStep);
+    el.classList.toggle("done", activeIndex >= 0 && idx >= 0 && idx < activeIndex);
+  });
 }
 
 function clearRefinePreview() {
@@ -689,13 +1105,19 @@ $("go").onclick = async () => {
   $("empty").style.display = "none";
   $("out").style.display = "none";
   $("meta").style.display = "none";
+  $("after-actions").style.display = "none";
+  $("save-r2-result").textContent = "";
   $("progress").style.display = "";
   $("progress-text").textContent = "Preparing";
-  $("progress-sub").textContent = "Encoding inputs";
+  $("progress-sub").textContent = "Optimizing prompt";
   $("progress-fill").style.width = "0%";
   $("progress-img").style.display = "none";
   $("progress-img").removeAttribute("src");
   $("progress-preview").classList.add("empty");
+  setProcessStep("refine");
+  let optimizedPrompt = "";
+  let optimizerNotes = "";
+  let optimizerSource = "";
 
   try {
     const refs_b64 = await Promise.all(refFiles.map(fileToB64));
@@ -710,6 +1132,7 @@ $("go").onclick = async () => {
         width: parseInt($("width").value),
         height: parseInt($("height").value),
         seed: parseInt($("seed").value),
+        style_settings: getStyleSettings(),
         refs_b64,
         keep_original_aspect: keepAspect,
         editing_scheduler: editingScheduler,
@@ -723,7 +1146,19 @@ $("go").onclick = async () => {
       const es = new EventSource(`/api/generate/stream/${jobId}`);
       es.onmessage = (ev) => {
         const d = JSON.parse(ev.data);
-        if (d.type === "progress") {
+        if (d.type === "status") {
+          $("progress-text").textContent = "Preparing";
+          $("progress-sub").textContent = d.message || "Optimizing prompt";
+          if (d.phase) setProcessStep(d.phase);
+        } else if (d.type === "optimized_prompt") {
+          optimizedPrompt = d.prompt || "";
+          optimizerNotes = d.intent_notes || "";
+          optimizerSource = d.source || "";
+          $("progress-text").textContent = "Prompt optimized";
+          $("progress-sub").textContent = "Starting HiDream-O1 generation";
+          setProcessStep("handoff");
+        } else if (d.type === "progress") {
+          setProcessStep("generate");
           const pct = Math.round((d.step / d.total) * 100);
           $("progress-text").textContent = `Generating · ${pct}%`;
           $("progress-sub").textContent = `Step ${d.step} / ${d.total}`;
@@ -735,8 +1170,26 @@ $("go").onclick = async () => {
           }
         } else if (d.type === "done") {
           $("img").src = "data:image/png;base64," + d.image;
+          setProcessStep("done");
+          lastImageB64 = d.image;
+          lastOriginalPrompt = d.original_prompt || prompt;
+          optimizedPrompt = d.optimized_prompt || optimizedPrompt;
+          optimizerNotes = d.intent_notes || optimizerNotes;
+          optimizerSource = d.optimizer_source || optimizerSource;
+          lastOptimizedPrompt = optimizedPrompt;
+          lastOptimizerSource = optimizerSource;
           $("progress").style.display = "none";
           $("out").style.display = "";
+          $("after-actions").style.display = "";
+          $("meta").style.display = "";
+          $("meta").innerHTML = `
+            <details>
+              <summary>Prompt sent to HiDream-O1</summary>
+              <div style="white-space:pre-wrap; margin-top:8px">${escapeHtml(optimizedPrompt)}</div>
+              ${optimizerSource ? `<div style="margin-top:8px; color:var(--muted)">Refiner: ${escapeHtml(optimizerSource)}</div>` : ""}
+              ${optimizerNotes ? `<div style="margin-top:8px; color:var(--muted)">${escapeHtml(optimizerNotes)}</div>` : ""}
+            </details>
+          `;
           es.close(); resolve();
         } else if (d.type === "error") {
           es.close(); reject(new Error(d.message));
@@ -751,6 +1204,147 @@ $("go").onclick = async () => {
   } finally {
     btn.disabled = false;
     btn.textContent = "Generate";
+  }
+};
+
+$("save-r2-btn").onclick = async () => {
+  if (!lastImageB64) { showErr("保存できる画像がありません。"); return; }
+  const btn = $("save-r2-btn");
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner-inline spinner-blue"></span>R2に保存中';
+  $("save-r2-result").textContent = "";
+  try {
+    const r = await fetch("/api/save-to-r2", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        image: lastImageB64,
+        original_prompt: lastOriginalPrompt,
+        optimized_prompt: lastOptimizedPrompt,
+        optimizer_source: lastOptimizerSource,
+        style_settings: getStyleSettings(),
+      }),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || "R2保存に失敗しました");
+    $("save-r2-result").textContent = `保存しました: ${data.bucket}/${data.image_key}`;
+  } catch (e) {
+    showErr(e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "R2に画像を保存";
+  }
+};
+
+$("edit-go").onclick = async () => {
+  const instruction = $("edit-prompt").value.trim();
+  if (!lastImageB64) { showErr("修正元の画像がありません。"); return; }
+  if (!instruction) { showErr("修正したい内容を入力してください。"); return; }
+
+  const btn = $("edit-go");
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner-inline"></span>修正中';
+  showErr("");
+  $("edit-chat").innerHTML += `<div><strong>あなた:</strong> ${escapeHtml(instruction)}</div>`;
+  $("empty").style.display = "none";
+  $("out").style.display = "none";
+  $("meta").style.display = "none";
+  $("after-actions").style.display = "none";
+  $("progress").style.display = "";
+  $("progress-text").textContent = "修正準備中";
+  $("progress-sub").textContent = "修正指示を英語化しています";
+  $("progress-fill").style.width = "0%";
+  $("progress-img").style.display = "none";
+  $("progress-img").removeAttribute("src");
+  $("progress-preview").classList.add("empty");
+  setProcessStep("refine");
+
+  let optimizedPrompt = "";
+  let optimizerNotes = "";
+  let optimizerSource = "";
+  const editOriginalPrompt = `${lastOriginalPrompt || ""}\n\n修正指示: ${instruction}`.trim();
+
+  try {
+    const startResp = await fetch("/api/generate/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        mode: "edit",
+        prompt: instruction,
+        width: parseInt($("width").value),
+        height: parseInt($("height").value),
+        seed: parseInt($("seed").value),
+        refs_b64: [lastImageB64],
+        keep_original_aspect: true,
+        editing_scheduler: "flow_match",
+        style_settings: getStyleSettings(),
+      }),
+    });
+    const startData = await startResp.json();
+    if (!startResp.ok) throw new Error(startData.error || "修正を開始できませんでした");
+
+    await new Promise((resolve, reject) => {
+      const es = new EventSource(`/api/generate/stream/${startData.job_id}`);
+      es.onmessage = (ev) => {
+        const d = JSON.parse(ev.data);
+        if (d.type === "status") {
+          $("progress-text").textContent = "修正準備中";
+          $("progress-sub").textContent = d.message || "修正指示を処理しています";
+          if (d.phase) setProcessStep(d.phase);
+        } else if (d.type === "optimized_prompt") {
+          optimizedPrompt = d.prompt || "";
+          optimizerNotes = d.intent_notes || "";
+          optimizerSource = d.source || "";
+          $("progress-text").textContent = "修正指示を最適化しました";
+          $("progress-sub").textContent = "HiDream-O1の画像編集へ送信します";
+          setProcessStep("handoff");
+        } else if (d.type === "progress") {
+          setProcessStep("generate");
+          const pct = Math.round((d.step / d.total) * 100);
+          $("progress-text").textContent = `画像を修正中 · ${pct}%`;
+          $("progress-sub").textContent = `ステップ ${d.step} / ${d.total}`;
+          $("progress-fill").style.width = pct + "%";
+          if (d.preview) {
+            $("progress-img").src = "data:image/jpeg;base64," + d.preview;
+            $("progress-img").style.display = "";
+            $("progress-preview").classList.remove("empty");
+          }
+        } else if (d.type === "done") {
+          $("img").src = "data:image/png;base64," + d.image;
+          setProcessStep("done");
+          lastImageB64 = d.image;
+          lastOriginalPrompt = editOriginalPrompt;
+          lastOptimizedPrompt = d.optimized_prompt || optimizedPrompt;
+          lastOptimizerSource = d.optimizer_source || optimizerSource;
+          $("progress").style.display = "none";
+          $("out").style.display = "";
+          $("after-actions").style.display = "";
+          $("meta").style.display = "";
+          $("meta").innerHTML = `
+            <details>
+              <summary>HiDream-O1へ送信した修正プロンプト</summary>
+              <div style="white-space:pre-wrap; margin-top:8px">${escapeHtml(lastOptimizedPrompt)}</div>
+              ${lastOptimizerSource ? `<div style="margin-top:8px; color:var(--muted)">Refiner: ${escapeHtml(lastOptimizerSource)}</div>` : ""}
+              ${optimizerNotes ? `<div style="margin-top:8px; color:var(--muted)">${escapeHtml(optimizerNotes)}</div>` : ""}
+            </details>
+          `;
+          $("edit-chat").innerHTML += `<div><strong>AI:</strong> 修正画像を生成しました。</div>`;
+          $("edit-prompt").value = "";
+          es.close(); resolve();
+        } else if (d.type === "error") {
+          es.close(); reject(new Error(d.message));
+        }
+      };
+      es.onerror = () => { es.close(); reject(new Error("修正処理の接続が切れました")); };
+    });
+  } catch (e) {
+    showErr(e.message);
+    $("progress").style.display = "none";
+    $("out").style.display = "";
+    $("after-actions").style.display = "";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "この画像を修正する";
   }
 };
 
@@ -780,7 +1374,6 @@ def index():
         INDEX_HTML,
         model_type=_STATE["model_type"],
         env_base_url=_env("OPENAI_BASE_URL", ),
-        env_api_key=_env("OPENAI_API_KEY", ),
         env_model=_env("OPENAI_MODEL", ),
     )
 
@@ -801,17 +1394,41 @@ def api_refine():
                 _STATE["agent"] = build_local_agent(model_id)
             refined = rewrite_prompt_local(*_STATE["agent"], prompt)
         elif backend == "api":
-            if not all([api_cfg.get("base_url"), api_cfg.get("api_key"), api_cfg.get("model")]):
+            base_url = api_cfg.get("base_url") or os.environ.get("OPENAI_BASE_URL", "")
+            api_key = api_cfg.get("api_key") or os.environ.get("OPENAI_API_KEY", "")
+            model_name = api_cfg.get("model") or os.environ.get("OPENAI_MODEL", "")
+            if not all([base_url, api_key, model_name]):
                 return jsonify({"error": "API requires base_url, api_key, model"}), 400
             refined = rewrite_prompt_api(
                 prompt,
-                base_url=api_cfg["base_url"],
-                api_key=api_cfg["api_key"],
-                model_name=api_cfg["model"],
+                base_url=base_url,
+                api_key=api_key,
+                model_name=model_name,
             )
         else:
             return jsonify({"error": f"Unknown backend: {backend}"}), 400
         return jsonify(refined)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/save-to-r2", methods=["POST"])
+def api_save_to_r2():
+    data = request.get_json(force=True)
+    image_b64 = (data.get("image") or "").strip()
+    if image_b64.startswith("data:image"):
+        image_b64 = image_b64.split(",", 1)[1]
+    if not image_b64:
+        return jsonify({"error": "No image to save."}), 400
+
+    metadata = {
+        "original_prompt": data.get("original_prompt", ""),
+        "optimized_prompt": data.get("optimized_prompt", ""),
+        "optimizer_source": data.get("optimizer_source", ""),
+        "style_settings": normalize_style_settings(data.get("style_settings") or {}),
+    }
+    try:
+        return jsonify(save_image_to_r2(image_b64, metadata))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -827,6 +1444,7 @@ def api_generate_start():
     width = int(data.get("width", 2048))
     height = int(data.get("height", 2048))
     seed = int(data.get("seed", 32))
+    style_settings = normalize_style_settings(data.get("style_settings") or {})
     refs_b64 = data.get("refs_b64") or []
     keep_original_aspect = bool(data.get("keep_original_aspect", False))
     editing_scheduler = data.get("editing_scheduler") or "flow_match"
@@ -847,6 +1465,21 @@ def api_generate_start():
     def worker():
         tmp_paths = []
         try:
+            q.put({
+                "type": "status",
+                "phase": "refine",
+                "message": "Refining Japanese prompt into O1-friendly English",
+            })
+            prompt_info = optimize_prompt_for_o1(prompt, mode=mode, style_settings=style_settings)
+            optimized_prompt = prompt_info["prompt"]
+            q.put({
+                "type": "optimized_prompt",
+                "phase": "handoff",
+                "prompt": optimized_prompt,
+                "intent_notes": prompt_info.get("intent_notes", ""),
+                "source": prompt_info.get("source", ""),
+            })
+
             for b64 in refs_b64:
                 raw = base64.b64decode(b64)
                 path = os.path.join(tempfile.gettempdir(), f"hidream_{uuid.uuid4().hex}.png")
@@ -910,7 +1543,7 @@ def api_generate_start():
                 image = generate_image(
                     model=_STATE["model"],
                     processor=_STATE["processor"],
-                    prompt=prompt,
+                    prompt=optimized_prompt,
                     ref_image_paths=tmp_paths if tmp_paths else None,
                     height=height,
                     width=width,
@@ -921,7 +1554,14 @@ def api_generate_start():
                 )
             buf = io.BytesIO()
             image.save(buf, format="PNG")
-            q.put({"type": "done", "image": base64.b64encode(buf.getvalue()).decode("ascii")})
+            q.put({
+                "type": "done",
+                "image": base64.b64encode(buf.getvalue()).decode("ascii"),
+                "original_prompt": prompt,
+                "optimized_prompt": optimized_prompt,
+                "optimizer_source": prompt_info.get("source", ""),
+                "intent_notes": prompt_info.get("intent_notes", ""),
+            })
         except Exception as e:
             q.put({"type": "error", "message": str(e)})
         finally:

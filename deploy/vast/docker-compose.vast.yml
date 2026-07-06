@@ -1,0 +1,22 @@
+services:
+  hidream-o1:
+    image: ghcr.io/YOUR_GITHUB_OWNER/hidream-o1-image:latest
+    container_name: hidream-o1-image
+    ports:
+      - "7861:7861"
+    env_file:
+      - ./env.vast
+    environment:
+      HIDREAM_HOST: 0.0.0.0
+      HIDREAM_PORT: 7861
+    volumes:
+      - /workspace/hidream-o1-models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    gpus: all
+    restart: unless-stopped

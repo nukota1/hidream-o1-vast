@@ -1,0 +1,9 @@
+name = "hidream-o1-web"
+main = "src/index.ts"
+compatibility_date = "2026-07-01"
+
+[vars]
+# Set this to the public Vast.ai URL that exposes port 7861.
+# Example: "https://your-vast-host.example.com"
+BACKEND_URL = "https://replace-with-vast-backend-url"
+ALLOWED_ORIGIN = "*"
