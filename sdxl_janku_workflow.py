@@ -42,13 +42,21 @@ def _download_if_needed(path, url):
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=3600) as response:
+    try:
+        response = urllib.request.urlopen(req, timeout=3600)
+    except Exception:
+        if not token:
+            raise
+        sep = "&" if "?" in url else "?"
+        response = urllib.request.urlopen(f"{url}{sep}token={token}", timeout=3600)
+    with response:
         with open(path, "wb") as f:
             while True:
                 chunk = response.read(1024 * 1024)
                 if not chunk:
                     break
                 f.write(chunk)
+    print(f"[sdxl] Download complete: {path}")
 
 
 def _load_single_file_or_repo(pipeline_cls, model_ref, dtype):

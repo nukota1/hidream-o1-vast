@@ -10,6 +10,10 @@ set -euo pipefail
 : "${HF_HOME:=/models/huggingface}"
 : "${HIDREAM_I1_REPO_DIR:=/workspace/third_party/HiDream-I1}"
 : "${HIDREAM_E11_REPO_DIR:=/workspace/third_party/HiDream-E1}"
+: "${JANKU_MODEL_PATH:=/models/checkpoints/janku-v6.safetensors}"
+: "${SDXL_DOWNLOAD_ON_START:=1}"
+: "${QWEN_IMAGE_EDIT_MODEL_REPO:=Qwen/Qwen-Image-Edit-2511}"
+: "${QWEN_IMAGE_EDIT_DOWNLOAD_ON_START:=1}"
 
 export HF_HOME
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME}"
@@ -19,8 +23,47 @@ echo "[entrypoint] HiDream model path: $HIDREAM_MODEL_PATH"
 echo "[entrypoint] HiDream model type: $HIDREAM_MODEL_TYPE"
 echo "[entrypoint] HiDream workflow: $HIDREAM_WORKFLOW"
 
+download_file() {
+  local url="$1"
+  local path="$2"
+  if [ -z "$url" ]; then
+    return 0
+  fi
+  if [ -f "$path" ]; then
+    echo "[entrypoint] Model already present: $path"
+    return 0
+  fi
+  echo "[entrypoint] Downloading model to $path"
+  mkdir -p "$(dirname "$path")"
+  if [ -n "${CIVITAI_TOKEN:-}" ]; then
+    if curl -fL --retry 5 -H "Authorization: Bearer $CIVITAI_TOKEN" "$url" -o "$path"; then
+      echo "[entrypoint] Download complete: $path"
+      return 0
+    fi
+    echo "[entrypoint] Bearer-token download failed. Retrying with Civitai token query..."
+    local sep="?"
+    case "$url" in
+      *\?*) sep="&" ;;
+    esac
+    curl -fL --retry 5 "${url}${sep}token=${CIVITAI_TOKEN}" -o "$path"
+  else
+    curl -fL --retry 5 "$url" -o "$path"
+  fi
+  echo "[entrypoint] Download complete: $path"
+}
+
 if [ "$HIDREAM_WORKFLOW" = "sdxl_janku" ]; then
-  echo "[entrypoint] SDXL/JANKU workflow enabled. Model files will be downloaded on first use."
+  if [ "$SDXL_DOWNLOAD_ON_START" = "1" ]; then
+    echo "[entrypoint] SDXL/JANKU workflow enabled. Downloading configured models before serving."
+    export JANKU_MODEL_PATH
+    download_file "${JANKU_MODEL_URL:-}" "$JANKU_MODEL_PATH"
+    if [ "$QWEN_IMAGE_EDIT_DOWNLOAD_ON_START" = "1" ]; then
+      echo "[entrypoint] Downloading Qwen image edit model cache: $QWEN_IMAGE_EDIT_MODEL_REPO"
+      huggingface-cli download "$QWEN_IMAGE_EDIT_MODEL_REPO"
+    fi
+  else
+    echo "[entrypoint] SDXL/JANKU workflow enabled. Model files will be downloaded on first use."
+  fi
 elif [ "$HIDREAM_WORKFLOW" = "i1_e11" ]; then
   mkdir -p /workspace/third_party
   if [ ! -d "$HIDREAM_I1_REPO_DIR/.git" ]; then

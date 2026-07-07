@@ -150,9 +150,9 @@ def build_local_agent(model_id):
     except ImportError:
         AutoModelForMultimodalLM = None
 
-    processor = AutoProcessor.from_pretrained(model_id)
+    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
     device = os.environ.get("HIDREAM_AGENT_DEVICE", "cpu").lower()
-    model_kwargs = {"dtype": "auto"}
+    model_kwargs = {"dtype": "auto", "trust_remote_code": True}
     if device == "cpu":
         model_kwargs["device_map"] = {"": "cpu"}
     elif device in {"cuda", "gpu"}:

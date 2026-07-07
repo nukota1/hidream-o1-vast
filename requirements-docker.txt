@@ -1,4 +1,4 @@
-transformers==4.57.1
+git+https://github.com/huggingface/transformers.git
 git+https://github.com/huggingface/diffusers.git
 accelerate
 einops
