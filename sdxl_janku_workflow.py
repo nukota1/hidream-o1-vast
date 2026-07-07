@@ -1,4 +1,5 @@
 import os
+import urllib.request
 
 import torch
 from PIL import Image
@@ -31,6 +32,25 @@ def _negative_prompt():
     )
 
 
+def _download_if_needed(path, url):
+    if not path or not url or os.path.isfile(path):
+        return
+    print(f"[sdxl] Downloading model to {path}")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    headers = {}
+    token = os.environ.get("CIVITAI_TOKEN", "")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=3600) as response:
+        with open(path, "wb") as f:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+
+
 def _load_single_file_or_repo(pipeline_cls, model_ref, dtype):
     if not model_ref:
         raise RuntimeError("Model path/repo is not configured.")
@@ -56,7 +76,9 @@ def _load_single_file_or_repo(pipeline_cls, model_ref, dtype):
 def load_janku_pipeline():
     from diffusers import AutoPipelineForText2Image
 
-    model_ref = os.environ.get("JANKU_MODEL_PATH") or os.environ.get("JANKU_MODEL_REPO")
+    model_path = os.environ.get("JANKU_MODEL_PATH", "")
+    _download_if_needed(model_path, os.environ.get("JANKU_MODEL_URL", ""))
+    model_ref = model_path or os.environ.get("JANKU_MODEL_REPO")
     print(f"[sdxl] Loading JANKU text-to-image model: {model_ref}")
     return _load_single_file_or_repo(AutoPipelineForText2Image, model_ref, _torch_dtype())
 
@@ -64,7 +86,9 @@ def load_janku_pipeline():
 def load_inpaint_pipeline():
     from diffusers import AutoPipelineForInpainting
 
-    model_ref = os.environ.get("SDXL_INPAINT_MODEL_PATH") or os.environ.get("SDXL_INPAINT_MODEL_REPO")
+    model_path = os.environ.get("SDXL_INPAINT_MODEL_PATH", "")
+    _download_if_needed(model_path, os.environ.get("SDXL_INPAINT_MODEL_URL", ""))
+    model_ref = model_path or os.environ.get("SDXL_INPAINT_MODEL_REPO")
     print(f"[sdxl] Loading inpaint model: {model_ref}")
     return _load_single_file_or_repo(AutoPipelineForInpainting, model_ref, _torch_dtype())
 

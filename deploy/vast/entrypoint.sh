@@ -10,8 +10,6 @@ set -euo pipefail
 : "${HF_HOME:=/models/huggingface}"
 : "${HIDREAM_I1_REPO_DIR:=/workspace/third_party/HiDream-I1}"
 : "${HIDREAM_E11_REPO_DIR:=/workspace/third_party/HiDream-E1}"
-: "${JANKU_MODEL_PATH:=/models/checkpoints/janku-v6.safetensors}"
-: "${SDXL_INPAINT_MODEL_PATH:=/models/checkpoints/sdxl-inpaint.safetensors}"
 
 export HF_HOME
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME}"
@@ -21,30 +19,8 @@ echo "[entrypoint] HiDream model path: $HIDREAM_MODEL_PATH"
 echo "[entrypoint] HiDream model type: $HIDREAM_MODEL_TYPE"
 echo "[entrypoint] HiDream workflow: $HIDREAM_WORKFLOW"
 
-download_file() {
-  local url="$1"
-  local path="$2"
-  if [ -z "$url" ]; then
-    return 0
-  fi
-  if [ -f "$path" ]; then
-    echo "[entrypoint] Model already present: $path"
-    return 0
-  fi
-  echo "[entrypoint] Downloading model to $path"
-  mkdir -p "$(dirname "$path")"
-  if [ -n "${CIVITAI_TOKEN:-}" ]; then
-    curl -fL --retry 5 -H "Authorization: Bearer $CIVITAI_TOKEN" "$url" -o "$path"
-  else
-    curl -fL --retry 5 "$url" -o "$path"
-  fi
-}
-
 if [ "$HIDREAM_WORKFLOW" = "sdxl_janku" ]; then
-  export JANKU_MODEL_PATH
-  export SDXL_INPAINT_MODEL_PATH
-  download_file "${JANKU_MODEL_URL:-}" "$JANKU_MODEL_PATH"
-  download_file "${SDXL_INPAINT_MODEL_URL:-}" "$SDXL_INPAINT_MODEL_PATH"
+  echo "[entrypoint] SDXL/JANKU workflow enabled. Model files will be downloaded on first use."
 elif [ "$HIDREAM_WORKFLOW" = "i1_e11" ]; then
   mkdir -p /workspace/third_party
   if [ ! -d "$HIDREAM_I1_REPO_DIR/.git" ]; then
