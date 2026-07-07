@@ -43,10 +43,10 @@ from hidream_i1_e11 import (
     load_i1_pipeline,
 )
 from sdxl_janku_workflow import (
+    edit_with_qwen_image_edit,
     generate_with_janku,
-    inpaint_with_sdxl,
-    load_inpaint_pipeline,
     load_janku_pipeline,
+    load_qwen_edit_pipeline,
 )
 from prompt_agent import (
     build_local_agent,
@@ -67,7 +67,7 @@ _STATE = {
     "i1_pipe": None,
     "e11_pipe": None,
     "janku_pipe": None,
-    "inpaint_pipe": None,
+    "qwen_edit_pipe": None,
     "agent": None,
 }
 _JOBS = {}
@@ -978,9 +978,9 @@ INDEX_HTML = r"""<!doctype html>
         <textarea id="edit-prompt" placeholder="例：表情を少し笑顔にして、背景の雨を強くしてください"></textarea>
         <label class="file-input" style="margin-top:10px">
           <input id="edit-mask" type="file" accept="image/*" />
-          <span>Inpaint mask image (optional)</span>
+          <span>Edit mask image (optional)</span>
         </label>
-        <div style="color:var(--muted); font-size:12px; margin-top:6px">White areas are edited. If omitted, the whole image is treated as editable.</div>
+        <div style="color:var(--muted); font-size:12px; margin-top:6px">For Qwen-Image-Edit, a mask is passed as a second reference image. White areas should indicate editable parts.</div>
         <button class="btn-primary" id="edit-go" style="margin-top: 12px">この画像を修正する</button>
         <div id="edit-chat" style="margin-top:12px; color:var(--muted); font-size:12.5px"></div>
       </div>
@@ -1619,14 +1619,14 @@ def api_generate_start():
                         q.put({
                             "type": "status",
                             "phase": "generate",
-                            "message": "Editing with SDXL inpaint",
+                            "message": "Editing with Qwen-Image-Edit-2511",
                         })
                         _STATE["janku_pipe"] = None
                         clear_cuda()
-                        if _STATE["inpaint_pipe"] is None:
-                            _STATE["inpaint_pipe"] = load_inpaint_pipeline()
-                        image = inpaint_with_sdxl(
-                            _STATE["inpaint_pipe"],
+                        if _STATE["qwen_edit_pipe"] is None:
+                            _STATE["qwen_edit_pipe"] = load_qwen_edit_pipeline()
+                        image = edit_with_qwen_image_edit(
+                            _STATE["qwen_edit_pipe"],
                             optimized_prompt,
                             tmp_paths[0],
                             mask_path,
@@ -1641,7 +1641,7 @@ def api_generate_start():
                             "phase": "generate",
                             "message": "Generating with JANKU",
                         })
-                        _STATE["inpaint_pipe"] = None
+                        _STATE["qwen_edit_pipe"] = None
                         clear_cuda()
                         if _STATE["janku_pipe"] is None:
                             _STATE["janku_pipe"] = load_janku_pipeline()
@@ -1786,7 +1786,7 @@ def main():
     p.add_argument("--workflow", type=str,
                    default=os.environ.get("HIDREAM_WORKFLOW", "o1"),
                    choices=["o1", "i1_e11", "sdxl_janku"],
-                   help="`o1`: use the unified O1 model. `i1_e11`: use I1 Dev for generation and E1.1 for editing. `sdxl_janku`: use JANKU for generation and SDXL inpaint for editing.")
+                   help="`o1`: use the unified O1 model. `i1_e11`: use I1 Dev for generation and E1.1 for editing. `sdxl_janku`: use JANKU for generation and Qwen-Image-Edit-2511 for editing.")
     p.add_argument("--model_path", type=str,
                    default=os.environ.get("HIDREAM_MODEL_PATH"),
                    help="Path to HiDream-O1-Image checkpoint directory. "
@@ -1811,7 +1811,7 @@ def main():
         _STATE["processor"] = processor
         _STATE["model"] = model
     elif _STATE["workflow"] == "sdxl_janku":
-        print("[app] SDXL JANKU + inpaint workflow enabled. Models will be loaded on first use.")
+        print("[app] JANKU + Qwen-Image-Edit-2511 workflow enabled. Models will be loaded on first use.")
     else:
         print("[app] I1 Dev + E1.1 workflow enabled. Models will be loaded on first use.")
     _STATE["model_type"] = args.model_type

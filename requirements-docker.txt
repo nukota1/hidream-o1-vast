@@ -1,5 +1,5 @@
 transformers==4.57.1
-diffusers
+git+https://github.com/huggingface/diffusers.git
 accelerate
 einops
 numpy

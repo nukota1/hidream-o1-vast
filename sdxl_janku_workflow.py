@@ -83,14 +83,18 @@ def load_janku_pipeline():
     return _load_single_file_or_repo(AutoPipelineForText2Image, model_ref, _torch_dtype())
 
 
-def load_inpaint_pipeline():
-    from diffusers import AutoPipelineForInpainting
+def load_qwen_edit_pipeline():
+    from diffusers import QwenImageEditPlusPipeline
 
-    model_path = os.environ.get("SDXL_INPAINT_MODEL_PATH", "")
-    _download_if_needed(model_path, os.environ.get("SDXL_INPAINT_MODEL_URL", ""))
-    model_ref = model_path or os.environ.get("SDXL_INPAINT_MODEL_REPO")
-    print(f"[sdxl] Loading inpaint model: {model_ref}")
-    return _load_single_file_or_repo(AutoPipelineForInpainting, model_ref, _torch_dtype())
+    model_ref = os.environ.get("QWEN_IMAGE_EDIT_MODEL_REPO", "Qwen/Qwen-Image-Edit-2511")
+    print(f"[qwen-edit] Loading image edit model: {model_ref}")
+    pipe = QwenImageEditPlusPipeline.from_pretrained(model_ref, torch_dtype=_torch_dtype())
+    pipe = pipe.to(_device())
+    try:
+        pipe.set_progress_bar_config(disable=None)
+    except Exception:
+        pass
+    return pipe
 
 
 def _generator(seed):
@@ -118,24 +122,31 @@ def _full_mask(size):
     return Image.new("L", size, 255)
 
 
-def inpaint_with_sdxl(pipe, prompt, image_path, mask_path, width, height, seed, callback=None):
+def edit_with_qwen_image_edit(pipe, prompt, image_path, mask_path, width, height, seed, callback=None):
     source = Image.open(image_path).convert("RGB")
-    mask = Image.open(mask_path).convert("L") if mask_path else _full_mask(source.size)
-    steps = int(os.environ.get("SDXL_INPAINT_STEPS", "28"))
-    guidance_scale = float(os.environ.get("SDXL_INPAINT_CFG_SCALE", "5"))
-    strength = float(os.environ.get("SDXL_INPAINT_STRENGTH", "0.75"))
+    images = [source]
+    edit_prompt = prompt
+    if mask_path:
+        mask = Image.open(mask_path).convert("RGB")
+        images.append(mask)
+        edit_prompt = (
+            prompt
+            + "\nUse the second image as an edit mask: white areas are editable, black areas must be preserved."
+        )
+    steps = int(os.environ.get("QWEN_IMAGE_EDIT_STEPS", "40"))
+    true_cfg_scale = float(os.environ.get("QWEN_IMAGE_EDIT_TRUE_CFG_SCALE", "4.0"))
+    guidance_scale = float(os.environ.get("QWEN_IMAGE_EDIT_GUIDANCE_SCALE", "1.0"))
+    negative_prompt = os.environ.get("QWEN_IMAGE_EDIT_NEGATIVE_PROMPT", " ")
     result = pipe(
-        prompt=prompt,
-        negative_prompt=_negative_prompt(),
-        image=source,
-        mask_image=mask,
-        width=width,
-        height=height,
-        strength=strength,
+        image=images,
+        prompt=edit_prompt,
+        generator=torch.Generator(device=_device()).manual_seed(int(seed)),
+        true_cfg_scale=true_cfg_scale,
+        negative_prompt=negative_prompt,
         num_inference_steps=steps,
         guidance_scale=guidance_scale,
-        generator=_generator(seed),
-    ).images[0]
+        num_images_per_prompt=1,
+    )
     if callback:
         callback(steps - 1, steps)
-    return result
+    return result.images[0]
