@@ -11,3 +11,5 @@ openai
 python-dotenv
 huggingface_hub[cli]
 boto3
+peft
+safetensors

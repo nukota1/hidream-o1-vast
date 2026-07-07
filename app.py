@@ -35,6 +35,13 @@ load_dotenv()
 
 from models.pipeline import DEFAULT_TIMESTEPS, generate_image
 from models.qwen3_vl_transformers import Qwen3VLForConditionalGeneration
+from hidream_i1_e11 import (
+    clear_cuda,
+    edit_with_e11,
+    generate_with_i1,
+    load_e11_pipeline,
+    load_i1_pipeline,
+)
 from prompt_agent import (
     build_local_agent,
     rewrite_prompt_api,
@@ -50,6 +57,9 @@ _STATE = {
     "model": None,
     "processor": None,
     "model_type": "full",
+    "workflow": os.environ.get("HIDREAM_WORKFLOW", "o1").lower(),
+    "i1_pipe": None,
+    "e11_pipe": None,
     "agent": None,
 }
 _JOBS = {}
@@ -62,9 +72,9 @@ AUTO_PROMPT_OPTIMIZE = os.environ.get("AUTO_PROMPT_OPTIMIZE", "1").lower() not i
 }
 
 O1_PROMPT_OPTIMIZER_SYSTEM = """
-You are a prompt director for HiDream-O1-Image-Dev.
+You are a prompt director for HiDream image models.
 Your job is to convert the user's request, in any language, into one clear English
-image-generation prompt that HiDream-O1 can follow.
+image-generation or image-editing prompt that HiDream can follow.
 
 Rules:
 - Preserve the user's intent, subject, composition, clothing, colors, mood, and location.
@@ -1500,6 +1510,8 @@ def api_generate_start():
 
     if mode == "edit" and len(refs_b64) != 1:
         return jsonify({"error": "Edit mode requires exactly one reference image"}), 400
+    if _STATE["workflow"] == "i1_e11" and mode == "subject":
+        return jsonify({"error": "Subject mode is not available in the I1 Dev + E1.1 workflow."}), 400
     if mode == "subject" and len(refs_b64) < 2:
         return jsonify({"error": "Subject mode requires at least two reference images"}), 400
     if keep_original_aspect and len(refs_b64) != 1:
@@ -1560,45 +1572,84 @@ def api_generate_start():
                 q.put(msg)
 
             with _GEN_LOCK:
-                if _STATE["model_type"] == "full":
-                    kwargs = dict(
-                        num_inference_steps=50,
-                        guidance_scale=5.0,
-                        shift=3.0,
-                        timesteps_list=None,
-                        scheduler_name="default",
-                    )
-                elif mode == "edit" and editing_scheduler == "flow_match":
-                    kwargs = dict(
-                        num_inference_steps=28,
-                        guidance_scale=0.0,
-                        shift=1.0,
-                        timesteps_list=DEFAULT_TIMESTEPS,
-                        scheduler_name="flow_match",
-                    )
+                if _STATE["workflow"] == "i1_e11":
+                    if mode == "edit":
+                        q.put({
+                            "type": "status",
+                            "phase": "generate",
+                            "message": "Editing with HiDream-E1.1",
+                        })
+                        _STATE["i1_pipe"] = None
+                        clear_cuda()
+                        if _STATE["e11_pipe"] is None:
+                            _STATE["e11_pipe"] = load_e11_pipeline()
+                        image = edit_with_e11(
+                            _STATE["e11_pipe"],
+                            optimized_prompt,
+                            tmp_paths[0],
+                            width,
+                            height,
+                            seed,
+                            callback=cb,
+                        )
+                    else:
+                        q.put({
+                            "type": "status",
+                            "phase": "generate",
+                            "message": "Generating with HiDream-I1-Dev",
+                        })
+                        _STATE["e11_pipe"] = None
+                        clear_cuda()
+                        if _STATE["i1_pipe"] is None:
+                            _STATE["i1_pipe"] = load_i1_pipeline()
+                        image = generate_with_i1(
+                            _STATE["i1_pipe"],
+                            optimized_prompt,
+                            width,
+                            height,
+                            seed,
+                            callback=cb,
+                        )
                 else:
-                    kwargs = dict(
-                        num_inference_steps=28,
-                        guidance_scale=0.0,
-                        shift=1.0,
-                        timesteps_list=DEFAULT_TIMESTEPS,
-                        scheduler_name="flash",
-                        noise_scale_start=7.5,
-                        noise_scale_end=7.5,
-                        noise_clip_std=2.5,
+                    if _STATE["model_type"] == "full":
+                        kwargs = dict(
+                            num_inference_steps=50,
+                            guidance_scale=5.0,
+                            shift=3.0,
+                            timesteps_list=None,
+                            scheduler_name="default",
+                        )
+                    elif mode == "edit" and editing_scheduler == "flow_match":
+                        kwargs = dict(
+                            num_inference_steps=28,
+                            guidance_scale=0.0,
+                            shift=1.0,
+                            timesteps_list=DEFAULT_TIMESTEPS,
+                            scheduler_name="flow_match",
+                        )
+                    else:
+                        kwargs = dict(
+                            num_inference_steps=28,
+                            guidance_scale=0.0,
+                            shift=1.0,
+                            timesteps_list=DEFAULT_TIMESTEPS,
+                            scheduler_name="flash",
+                            noise_scale_start=7.5,
+                            noise_scale_end=7.5,
+                            noise_clip_std=2.5,
+                        )
+                    image = generate_image(
+                        model=_STATE["model"],
+                        processor=_STATE["processor"],
+                        prompt=optimized_prompt,
+                        ref_image_paths=tmp_paths if tmp_paths else None,
+                        height=height,
+                        width=width,
+                        seed=seed,
+                        keep_original_aspect=keep_original_aspect,
+                        callback=cb,
+                        **kwargs,
                     )
-                image = generate_image(
-                    model=_STATE["model"],
-                    processor=_STATE["processor"],
-                    prompt=optimized_prompt,
-                    ref_image_paths=tmp_paths if tmp_paths else None,
-                    height=height,
-                    width=width,
-                    seed=seed,
-                    keep_original_aspect=keep_original_aspect,
-                    callback=cb,
-                    **kwargs,
-                )
             buf = io.BytesIO()
             image.save(buf, format="PNG")
             q.put({
@@ -1648,6 +1699,10 @@ def api_generate_stream(job_id):
 
 def main():
     p = argparse.ArgumentParser("HiDream-O1-Image Flask app")
+    p.add_argument("--workflow", type=str,
+                   default=os.environ.get("HIDREAM_WORKFLOW", "o1"),
+                   choices=["o1", "i1_e11"],
+                   help="`o1`: use the unified O1 model. `i1_e11`: use I1 Dev for generation and E1.1 for editing.")
     p.add_argument("--model_path", type=str,
                    default=os.environ.get("HIDREAM_MODEL_PATH"),
                    help="Path to HiDream-O1-Image checkpoint directory. "
@@ -1661,13 +1716,18 @@ def main():
                    default=int(os.environ.get("HIDREAM_PORT", "7860")))
     args = p.parse_args()
 
-    if not args.model_path:
+    _STATE["workflow"] = args.workflow.lower()
+
+    if _STATE["workflow"] == "o1" and not args.model_path:
         p.error("--model_path is required (or set HIDREAM_MODEL_PATH in .env)")
 
     assert torch.cuda.is_available(), "CUDA is required for inference."
-    processor, model = load_image_model(args.model_path)
-    _STATE["processor"] = processor
-    _STATE["model"] = model
+    if _STATE["workflow"] == "o1":
+        processor, model = load_image_model(args.model_path)
+        _STATE["processor"] = processor
+        _STATE["model"] = model
+    else:
+        print("[app] I1 Dev + E1.1 workflow enabled. Models will be loaded on first use.")
     _STATE["model_type"] = args.model_type
 
     print(f"[app] Serving on http://{args.host}:{args.port}")
