@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import re
 
 
@@ -145,10 +146,17 @@ def build_local_agent(model_id):
     from transformers import AutoProcessor, AutoModelForCausalLM
 
     processor = AutoProcessor.from_pretrained(model_id)
+    device = os.environ.get("HIDREAM_AGENT_DEVICE", "cpu").lower()
+    model_kwargs = {"dtype": "auto"}
+    if device == "cpu":
+        model_kwargs["device_map"] = {"": "cpu"}
+    elif device in {"cuda", "gpu"}:
+        model_kwargs["device_map"] = "cuda"
+    else:
+        model_kwargs["device_map"] = "auto"
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        dtype="auto",
-        device_map="auto",
+        **model_kwargs,
     )
     model.eval()
     return processor, model

@@ -56,6 +56,7 @@ _JOBS = {}
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://host.docker.internal:11434").rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.5:9b")
+PROMPT_OPTIMIZER_BACKEND = os.environ.get("PROMPT_OPTIMIZER_BACKEND", "api").lower()
 AUTO_PROMPT_OPTIMIZE = os.environ.get("AUTO_PROMPT_OPTIMIZE", "1").lower() not in {
     "0", "false", "no", "off"
 }
@@ -242,6 +243,36 @@ def post_openai_compatible_chat(messages, timeout=180):
         return json.loads(response.read().decode("utf-8"))
 
 
+def post_local_agent_chat(messages):
+    if _STATE["agent"] is None:
+        model_id = os.environ.get("HIDREAM_AGENT_MODEL", "google/gemma-2-2b-it")
+        print(f"[prompt] Loading local prompt optimizer: {model_id}")
+        _STATE["agent"] = build_local_agent(model_id)
+
+    processor, model = _STATE["agent"]
+    text = processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    inputs = processor(text=text, return_tensors="pt")
+    target_device = getattr(model, "device", torch.device("cpu"))
+    inputs = inputs.to(target_device)
+    input_len = inputs["input_ids"].shape[-1]
+    max_new_tokens = int(os.environ.get("HIDREAM_AGENT_MAX_NEW_TOKENS", "1400"))
+    temperature = float(os.environ.get("HIDREAM_AGENT_TEMPERATURE", "0"))
+
+    with torch.inference_mode():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=temperature > 0,
+            temperature=max(temperature, 1e-5),
+        )
+    return processor.decode(outputs[0][input_len:], skip_special_tokens=True)
+
+
 def parse_chat_completion(result):
     choices = result.get("choices") or []
     if not choices:
@@ -264,42 +295,58 @@ def optimize_prompt_for_o1(user_prompt, mode="t2i", style_settings=None):
         f"{describe_style_settings(style_settings)}\n\n"
         f"{user_prompt}"
     )
-    try:
-        result = post_openai_compatible_chat(
-            [
-                {"role": "system", "content": O1_PROMPT_OPTIMIZER_SYSTEM},
-                {"role": "user", "content": user_message},
-            ]
-        )
-        raw = parse_chat_completion(result)
+
+    def _parsed_result(raw, source):
         parsed = parse_json_object(raw)
         optimized = str(parsed.get("prompt", "")).strip()
         if len(optimized) < 40:
             raise ValueError("Optimizer returned a prompt that is too short.")
         return {
             "prompt": optimized,
-            "intent_notes": str(parsed.get("intent_notes", "")).strip(),
-            "source": os.environ.get("OPENAI_MODEL", "openai-compatible"),
+            "intent_notes": str(parsed.get("intent_notes", parsed.get("reasoning", ""))).strip(),
+            "source": source,
         }
+
+    messages = [
+        {"role": "system", "content": O1_PROMPT_OPTIMIZER_SYSTEM},
+        {"role": "user", "content": user_message},
+    ]
+
+    if PROMPT_OPTIMIZER_BACKEND == "local":
+        try:
+            raw = post_local_agent_chat(messages)
+            return _parsed_result(raw, os.environ.get("HIDREAM_AGENT_MODEL", "local"))
+        except Exception as exc:
+            print(f"[prompt] Local optimization failed: {exc}")
+            return {
+                "prompt": fallback_o1_prompt(user_prompt),
+                "intent_notes": f"Fallback prompt wrapper used because local optimization failed: {exc}",
+                "source": "fallback",
+            }
+
+    if PROMPT_OPTIMIZER_BACKEND == "ollama":
+        try:
+            result = post_ollama_chat(messages)
+            raw = result.get("message", {}).get("content", "")
+            return _parsed_result(raw, "ollama")
+        except Exception as exc:
+            print(f"[prompt] Ollama optimization failed: {exc}")
+            return {
+                "prompt": fallback_o1_prompt(user_prompt),
+                "intent_notes": f"Fallback prompt wrapper used because Ollama optimization failed: {exc}",
+                "source": "fallback",
+            }
+
+    try:
+        result = post_openai_compatible_chat(messages)
+        raw = parse_chat_completion(result)
+        return _parsed_result(raw, os.environ.get("OPENAI_MODEL", "openai-compatible"))
     except Exception as api_exc:
         print(f"[prompt] OpenAI-compatible optimization failed, falling back to Ollama: {api_exc}")
     try:
-        result = post_ollama_chat(
-            [
-                {"role": "system", "content": O1_PROMPT_OPTIMIZER_SYSTEM},
-                {"role": "user", "content": user_message},
-            ]
-        )
+        result = post_ollama_chat(messages)
         raw = result.get("message", {}).get("content", "")
-        parsed = parse_json_object(raw)
-        optimized = str(parsed.get("prompt", "")).strip()
-        if len(optimized) < 40:
-            raise ValueError("Optimizer returned a prompt that is too short.")
-        return {
-            "prompt": optimized,
-            "intent_notes": str(parsed.get("intent_notes", "")).strip(),
-            "source": "ollama",
-        }
+        return _parsed_result(raw, "ollama")
     except Exception as exc:
         print(f"[prompt] O1 prompt optimization failed: {exc}")
         return {
