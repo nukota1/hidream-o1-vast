@@ -42,6 +42,12 @@ from hidream_i1_e11 import (
     load_e11_pipeline,
     load_i1_pipeline,
 )
+from sdxl_janku_workflow import (
+    generate_with_janku,
+    inpaint_with_sdxl,
+    load_inpaint_pipeline,
+    load_janku_pipeline,
+)
 from prompt_agent import (
     build_local_agent,
     rewrite_prompt_api,
@@ -60,6 +66,8 @@ _STATE = {
     "workflow": os.environ.get("HIDREAM_WORKFLOW", "o1").lower(),
     "i1_pipe": None,
     "e11_pipe": None,
+    "janku_pipe": None,
+    "inpaint_pipe": None,
     "agent": None,
 }
 _JOBS = {}
@@ -88,6 +96,20 @@ Rules:
 - Turn long bullet lists into a natural, dense single paragraph.
 - Keep fine character details, camera direction, pose, weather, background, and material details.
 - For O1, use direct visual language and avoid tag soup.
+- Output JSON only, with keys "prompt" and "intent_notes".
+""".strip()
+
+SDXL_PROMPT_OPTIMIZER_SYSTEM = """
+You are a prompt director for anime SDXL checkpoints such as JANKU, Illustrious, and WAI.
+Convert the user's request, in any language, into one English prompt optimized for anime image generation.
+
+Rules:
+- Preserve the user's exact subject, outfit, pose, composition, camera, background, mood, and colors.
+- If the user wants visual novel, bishoujo game, manga, anime, or illustration, make that explicit.
+- Use a compact mix of natural English and useful booru-style tags.
+- Put the most important subject and style terms first.
+- Avoid unrelated characters, brands, logos, text, and extra objects.
+- For inpaint/edit instructions, describe the desired final visual result, not the editing process.
 - Output JSON only, with keys "prompt" and "intent_notes".
 """.strip()
 
@@ -317,8 +339,9 @@ def optimize_prompt_for_o1(user_prompt, mode="t2i", style_settings=None):
             "source": source,
         }
 
+    system_prompt = SDXL_PROMPT_OPTIMIZER_SYSTEM if _STATE.get("workflow") == "sdxl_janku" else O1_PROMPT_OPTIMIZER_SYSTEM
     messages = [
-        {"role": "system", "content": O1_PROMPT_OPTIMIZER_SYSTEM},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_message},
     ]
 
@@ -953,6 +976,11 @@ INDEX_HTML = r"""<!doctype html>
         <div id="save-r2-result" style="color:var(--muted); font-size:12.5px; margin-bottom:14px"></div>
         <div class="label">AIに修正を依頼</div>
         <textarea id="edit-prompt" placeholder="例：表情を少し笑顔にして、背景の雨を強くしてください"></textarea>
+        <label class="file-input" style="margin-top:10px">
+          <input id="edit-mask" type="file" accept="image/*" />
+          <span>Inpaint mask image (optional)</span>
+        </label>
+        <div style="color:var(--muted); font-size:12px; margin-top:6px">White areas are edited. If omitted, the whole image is treated as editable.</div>
         <button class="btn-primary" id="edit-go" style="margin-top: 12px">この画像を修正する</button>
         <div id="edit-chat" style="margin-top:12px; color:var(--muted); font-size:12.5px"></div>
       </div>
@@ -1320,6 +1348,8 @@ $("edit-go").onclick = async () => {
   let optimizerNotes = "";
   let optimizerSource = "";
   const editOriginalPrompt = `${lastOriginalPrompt || ""}\n\n修正指示: ${instruction}`.trim();
+  const maskFile = $("edit-mask") && $("edit-mask").files.length ? $("edit-mask").files[0] : null;
+  const maskB64 = maskFile ? await fileToB64(maskFile) : "";
 
   try {
     const startResp = await fetch("/api/generate/start", {
@@ -1332,6 +1362,7 @@ $("edit-go").onclick = async () => {
         height: parseInt($("height").value),
         seed: parseInt($("seed").value),
         refs_b64: [lastImageB64],
+        mask_b64: maskB64,
         keep_original_aspect: true,
         editing_scheduler: "flow_match",
         style_settings: getStyleSettings(),
@@ -1503,6 +1534,7 @@ def api_generate_start():
     seed = int(data.get("seed", 32))
     style_settings = normalize_style_settings(data.get("style_settings") or {})
     refs_b64 = data.get("refs_b64") or []
+    mask_b64 = (data.get("mask_b64") or "").strip()
     keep_original_aspect = bool(data.get("keep_original_aspect", False))
     editing_scheduler = data.get("editing_scheduler") or "flow_match"
     if editing_scheduler not in ("flow_match", "flash"):
@@ -1510,8 +1542,8 @@ def api_generate_start():
 
     if mode == "edit" and len(refs_b64) != 1:
         return jsonify({"error": "Edit mode requires exactly one reference image"}), 400
-    if _STATE["workflow"] == "i1_e11" and mode == "subject":
-        return jsonify({"error": "Subject mode is not available in the I1 Dev + E1.1 workflow."}), 400
+    if _STATE["workflow"] in ("i1_e11", "sdxl_janku") and mode == "subject":
+        return jsonify({"error": f"Subject mode is not available in the {_STATE['workflow']} workflow."}), 400
     if mode == "subject" and len(refs_b64) < 2:
         return jsonify({"error": "Subject mode requires at least two reference images"}), 400
     if keep_original_aspect and len(refs_b64) != 1:
@@ -1523,6 +1555,7 @@ def api_generate_start():
 
     def worker():
         tmp_paths = []
+        mask_path = None
         try:
             q.put({
                 "type": "status",
@@ -1545,6 +1578,15 @@ def api_generate_start():
                 with open(path, "wb") as f:
                     f.write(raw)
                 tmp_paths.append(path)
+            if mask_b64:
+                if mask_b64.startswith("data:image"):
+                    mask_b64_clean = mask_b64.split(",", 1)[1]
+                else:
+                    mask_b64_clean = mask_b64
+                raw = base64.b64decode(mask_b64_clean)
+                mask_path = os.path.join(tempfile.gettempdir(), f"hidream_mask_{uuid.uuid4().hex}.png")
+                with open(mask_path, "wb") as f:
+                    f.write(raw)
 
             def cb(step, total, get_preview=None):
                 msg = {"type": "progress", "step": step + 1, "total": total}
@@ -1572,7 +1614,46 @@ def api_generate_start():
                 q.put(msg)
 
             with _GEN_LOCK:
-                if _STATE["workflow"] == "i1_e11":
+                if _STATE["workflow"] == "sdxl_janku":
+                    if mode == "edit":
+                        q.put({
+                            "type": "status",
+                            "phase": "generate",
+                            "message": "Editing with SDXL inpaint",
+                        })
+                        _STATE["janku_pipe"] = None
+                        clear_cuda()
+                        if _STATE["inpaint_pipe"] is None:
+                            _STATE["inpaint_pipe"] = load_inpaint_pipeline()
+                        image = inpaint_with_sdxl(
+                            _STATE["inpaint_pipe"],
+                            optimized_prompt,
+                            tmp_paths[0],
+                            mask_path,
+                            width,
+                            height,
+                            seed,
+                            callback=cb,
+                        )
+                    else:
+                        q.put({
+                            "type": "status",
+                            "phase": "generate",
+                            "message": "Generating with JANKU",
+                        })
+                        _STATE["inpaint_pipe"] = None
+                        clear_cuda()
+                        if _STATE["janku_pipe"] is None:
+                            _STATE["janku_pipe"] = load_janku_pipeline()
+                        image = generate_with_janku(
+                            _STATE["janku_pipe"],
+                            optimized_prompt,
+                            width,
+                            height,
+                            seed,
+                            callback=cb,
+                        )
+                elif _STATE["workflow"] == "i1_e11":
                     if mode == "edit":
                         q.put({
                             "type": "status",
@@ -1666,6 +1747,9 @@ def api_generate_start():
             for p in tmp_paths:
                 try: os.remove(p)
                 except OSError: pass
+            if mask_path:
+                try: os.remove(mask_path)
+                except OSError: pass
             q.put(None)
 
     threading.Thread(target=worker, daemon=True).start()
@@ -1701,8 +1785,8 @@ def main():
     p = argparse.ArgumentParser("HiDream-O1-Image Flask app")
     p.add_argument("--workflow", type=str,
                    default=os.environ.get("HIDREAM_WORKFLOW", "o1"),
-                   choices=["o1", "i1_e11"],
-                   help="`o1`: use the unified O1 model. `i1_e11`: use I1 Dev for generation and E1.1 for editing.")
+                   choices=["o1", "i1_e11", "sdxl_janku"],
+                   help="`o1`: use the unified O1 model. `i1_e11`: use I1 Dev for generation and E1.1 for editing. `sdxl_janku`: use JANKU for generation and SDXL inpaint for editing.")
     p.add_argument("--model_path", type=str,
                    default=os.environ.get("HIDREAM_MODEL_PATH"),
                    help="Path to HiDream-O1-Image checkpoint directory. "
@@ -1726,6 +1810,8 @@ def main():
         processor, model = load_image_model(args.model_path)
         _STATE["processor"] = processor
         _STATE["model"] = model
+    elif _STATE["workflow"] == "sdxl_janku":
+        print("[app] SDXL JANKU + inpaint workflow enabled. Models will be loaded on first use.")
     else:
         print("[app] I1 Dev + E1.1 workflow enabled. Models will be loaded on first use.")
     _STATE["model_type"] = args.model_type
