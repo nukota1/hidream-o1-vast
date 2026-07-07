@@ -145,6 +145,11 @@ def _wrap_result(raw, user_input):
 def build_local_agent(model_id):
     from transformers import AutoProcessor, AutoModelForCausalLM
 
+    try:
+        from transformers import AutoModelForMultimodalLM
+    except ImportError:
+        AutoModelForMultimodalLM = None
+
     processor = AutoProcessor.from_pretrained(model_id)
     device = os.environ.get("HIDREAM_AGENT_DEVICE", "cpu").lower()
     model_kwargs = {"dtype": "auto"}
@@ -154,10 +159,22 @@ def build_local_agent(model_id):
         model_kwargs["device_map"] = "cuda"
     else:
         model_kwargs["device_map"] = "auto"
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        **model_kwargs,
-    )
+
+    loaders = []
+    if AutoModelForMultimodalLM is not None:
+        loaders.append(AutoModelForMultimodalLM)
+    loaders.append(AutoModelForCausalLM)
+
+    last_error = None
+    for loader in loaders:
+        try:
+            model = loader.from_pretrained(model_id, **model_kwargs)
+            break
+        except Exception as exc:
+            last_error = exc
+    else:
+        raise last_error
+
     model.eval()
     return processor, model
 
