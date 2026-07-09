@@ -70,6 +70,70 @@ def _download_status_message(path, tmp_path, min_bytes, waited):
     )
 
 
+def _r2_config():
+    bucket = os.environ.get("JANKU_R2_BUCKET", "").strip()
+    key = os.environ.get("JANKU_R2_KEY", "").strip()
+    endpoint_url = os.environ.get("R2_ENDPOINT_URL", "").strip()
+    access_key = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
+    secret_key = os.environ.get("R2_SECRET_ACCESS_KEY", "").strip()
+    if not bucket or not key:
+        return None
+    missing = [
+        name
+        for name, value in (
+            ("R2_ENDPOINT_URL", endpoint_url),
+            ("R2_ACCESS_KEY_ID", access_key),
+            ("R2_SECRET_ACCESS_KEY", secret_key),
+        )
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(f"Missing R2 settings for JANKU model download: {', '.join(missing)}")
+    return bucket, key, endpoint_url, access_key, secret_key
+
+
+def _download_from_r2(path, tmp_path, min_bytes, status_callback=None):
+    import boto3
+    from botocore.config import Config
+
+    bucket, key, endpoint_url, access_key, secret_key = _r2_config()
+    if status_callback:
+        status_callback(f"Downloading JANKU model from R2: s3://{bucket}/{key}")
+
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name="auto",
+        config=Config(
+            signature_version="s3v4",
+            retries={"max_attempts": 10, "mode": "standard"},
+        ),
+    )
+
+    transferred = 0
+    next_status = 512 * 1024 * 1024
+
+    def progress(bytes_amount):
+        nonlocal transferred, next_status
+        transferred += bytes_amount
+        if status_callback and transferred >= next_status:
+            status_callback(
+                f"Downloading JANKU model from R2: {_format_bytes(transferred)}"
+            )
+            next_status += 512 * 1024 * 1024
+
+    with open(tmp_path, "wb") as f:
+        client.download_fileobj(bucket, key, f, Callback=progress)
+
+    if not _is_complete_file(tmp_path, min_bytes):
+        raise RuntimeError(f"Downloaded R2 model is smaller than expected: {tmp_path}")
+    os.replace(tmp_path, path)
+    if status_callback:
+        status_callback("JANKU model download from R2 complete; loading model")
+
+
 def _download_url(url, tmp_path, token):
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     req = urllib.request.Request(url, headers=headers)
@@ -83,7 +147,8 @@ def _download_url(url, tmp_path, token):
 
 
 def _download_if_needed(path, url, status_callback=None):
-    if not path or not url:
+    r2_configured = _r2_config() is not None
+    if not path or (not url and not r2_configured):
         return
     min_bytes = _min_janku_bytes()
     if _is_complete_file(path, min_bytes):
@@ -107,9 +172,22 @@ def _download_if_needed(path, url, status_callback=None):
     if os.path.isfile(path):
         os.remove(path)
     print(f"[sdxl] Downloading model to {path}")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if r2_configured:
+        if status_callback:
+            status_callback("Downloading JANKU model from R2 before generation")
+        try:
+            _download_from_r2(path, tmp_path, min_bytes, status_callback=status_callback)
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+        return
+
     if status_callback:
         status_callback("Downloading JANKU model before generation")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
     token = os.environ.get("CIVITAI_TOKEN", "")
     response = _download_url(url, tmp_path, token)
     try:

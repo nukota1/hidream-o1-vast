@@ -180,6 +180,25 @@ generated/YYYY/MM/DD/<uuid>.json
 
 Do not commit `.env`, `env.vast`, API keys, R2 access keys, or model files.
 
+### R2 model cache for JANKU
+
+For the `sdxl_janku` workflow, Civitai downloads can be unstable. Put the JANKU
+checkpoint in a private R2 bucket and point Vast.ai at that object:
+
+```text
+JANKU_MODEL_PATH=/models/checkpoints/jankuV60.safetensors
+JANKU_MODEL_URL=
+JANKU_R2_BUCKET=hidream-o1-model-cache
+JANKU_R2_KEY=models/jankuV60.safetensors
+R2_ENDPOINT_URL=https://<account-id>.r2.cloudflarestorage.com
+R2_ACCESS_KEY_ID=<r2-access-key>
+R2_SECRET_ACCESS_KEY=<r2-secret-key>
+```
+
+When `JANKU_R2_BUCKET` and `JANKU_R2_KEY` are set, the entrypoint downloads JANKU
+from R2 instead of Civitai. Keep the bucket in Standard storage if you want it to
+count toward the R2 free tier.
+
 ## Notes
 
 - OpenRouter free models may return HTTP 429. The app falls back to local Ollama if configured.

@@ -12,6 +12,8 @@ set -euo pipefail
 : "${HIDREAM_E11_REPO_DIR:=/workspace/third_party/HiDream-E1}"
 : "${JANKU_MODEL_PATH:=/models/checkpoints/janku-v6.safetensors}"
 : "${JANKU_MODEL_MIN_BYTES:=6000000000}"
+: "${JANKU_R2_BUCKET:=}"
+: "${JANKU_R2_KEY:=}"
 : "${SDXL_DOWNLOAD_ON_START:=1}"
 : "${QWEN_IMAGE_EDIT_MODEL_REPO:=Qwen/Qwen-Image-Edit-2511}"
 : "${QWEN_IMAGE_EDIT_DOWNLOAD_ON_START:=1}"
@@ -121,11 +123,31 @@ download_file() {
   echo "[entrypoint] Download complete: $path"
 }
 
+download_janku_model() {
+  if valid_download "$JANKU_MODEL_PATH" "$JANKU_MODEL_MIN_BYTES"; then
+    echo "[entrypoint] Model already present: $JANKU_MODEL_PATH"
+    return 0
+  fi
+
+  if [ -n "$JANKU_R2_BUCKET" ] && [ -n "$JANKU_R2_KEY" ]; then
+    echo "[entrypoint] JANKU R2 cache enabled: s3://$JANKU_R2_BUCKET/$JANKU_R2_KEY"
+    rm -f "$JANKU_MODEL_PATH"
+    python3 /workspace/HiDream-O1-Image/deploy/vast/download_r2_object.py \
+      --bucket "$JANKU_R2_BUCKET" \
+      --key "$JANKU_R2_KEY" \
+      --output "$JANKU_MODEL_PATH" \
+      --min-bytes "$JANKU_MODEL_MIN_BYTES"
+    return $?
+  fi
+
+  download_file "${JANKU_MODEL_URL:-}" "$JANKU_MODEL_PATH" "$JANKU_MODEL_MIN_BYTES"
+}
+
 prefetch_sdxl_models() {
   set +e
   echo "[entrypoint] Background model prefetch started."
   export JANKU_MODEL_PATH
-  download_file "${JANKU_MODEL_URL:-}" "$JANKU_MODEL_PATH" "$JANKU_MODEL_MIN_BYTES"
+  download_janku_model
   local janku_status=$?
   if [ "$janku_status" -ne 0 ]; then
     echo "[entrypoint] JANKU prefetch failed with exit code $janku_status."
