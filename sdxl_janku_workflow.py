@@ -1,4 +1,5 @@
 import os
+import time
 import urllib.request
 
 import torch
@@ -35,6 +36,18 @@ def _negative_prompt():
 def _download_if_needed(path, url):
     if not path or not url or os.path.isfile(path):
         return
+    tmp_path = f"{path}.part"
+    wait_seconds = int(os.environ.get("SDXL_DOWNLOAD_WAIT_SECONDS", "7200"))
+    waited = 0
+    while os.path.isfile(tmp_path) and not os.path.isfile(path):
+        if waited == 0:
+            print(f"[sdxl] Waiting for background download: {path}")
+        if waited >= wait_seconds:
+            raise RuntimeError(f"Timed out waiting for background download: {path}")
+        time.sleep(5)
+        waited += 5
+    if os.path.isfile(path):
+        return
     print(f"[sdxl] Downloading model to {path}")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     headers = {}
@@ -49,13 +62,21 @@ def _download_if_needed(path, url):
             raise
         sep = "&" if "?" in url else "?"
         response = urllib.request.urlopen(f"{url}{sep}token={token}", timeout=3600)
-    with response:
-        with open(path, "wb") as f:
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
+    try:
+        with response:
+            with open(tmp_path, "wb") as f:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
     print(f"[sdxl] Download complete: {path}")
 
 

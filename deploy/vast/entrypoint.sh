@@ -26,6 +26,7 @@ echo "[entrypoint] HiDream workflow: $HIDREAM_WORKFLOW"
 download_file() {
   local url="$1"
   local path="$2"
+  local tmp_path="${path}.part"
   if [ -z "$url" ]; then
     return 0
   fi
@@ -35,8 +36,10 @@ download_file() {
   fi
   echo "[entrypoint] Downloading model to $path"
   mkdir -p "$(dirname "$path")"
+  rm -f "$tmp_path"
   if [ -n "${CIVITAI_TOKEN:-}" ]; then
-    if curl -fL --retry 5 -H "Authorization: Bearer $CIVITAI_TOKEN" "$url" -o "$path"; then
+    if curl -fL --retry 5 -H "Authorization: Bearer $CIVITAI_TOKEN" "$url" -o "$tmp_path"; then
+      mv "$tmp_path" "$path"
       echo "[entrypoint] Download complete: $path"
       return 0
     fi
@@ -45,22 +48,38 @@ download_file() {
     case "$url" in
       *\?*) sep="&" ;;
     esac
-    curl -fL --retry 5 "${url}${sep}token=${CIVITAI_TOKEN}" -o "$path"
+    curl -fL --retry 5 "${url}${sep}token=${CIVITAI_TOKEN}" -o "$tmp_path"
   else
-    curl -fL --retry 5 "$url" -o "$path"
+    curl -fL --retry 5 "$url" -o "$tmp_path"
   fi
+  mv "$tmp_path" "$path"
   echo "[entrypoint] Download complete: $path"
+}
+
+prefetch_sdxl_models() {
+  set +e
+  echo "[entrypoint] Background model prefetch started."
+  export JANKU_MODEL_PATH
+  download_file "${JANKU_MODEL_URL:-}" "$JANKU_MODEL_PATH"
+  local janku_status=$?
+  if [ "$janku_status" -ne 0 ]; then
+    echo "[entrypoint] JANKU prefetch failed with exit code $janku_status."
+  fi
+  if [ "$QWEN_IMAGE_EDIT_DOWNLOAD_ON_START" = "1" ]; then
+    echo "[entrypoint] Downloading Qwen image edit model cache: $QWEN_IMAGE_EDIT_MODEL_REPO"
+    huggingface-cli download "$QWEN_IMAGE_EDIT_MODEL_REPO"
+    local qwen_status=$?
+    if [ "$qwen_status" -ne 0 ]; then
+      echo "[entrypoint] Qwen image edit prefetch failed with exit code $qwen_status."
+    fi
+  fi
+  echo "[entrypoint] Background model prefetch finished."
 }
 
 if [ "$HIDREAM_WORKFLOW" = "sdxl_janku" ]; then
   if [ "$SDXL_DOWNLOAD_ON_START" = "1" ]; then
-    echo "[entrypoint] SDXL/JANKU workflow enabled. Downloading configured models before serving."
-    export JANKU_MODEL_PATH
-    download_file "${JANKU_MODEL_URL:-}" "$JANKU_MODEL_PATH"
-    if [ "$QWEN_IMAGE_EDIT_DOWNLOAD_ON_START" = "1" ]; then
-      echo "[entrypoint] Downloading Qwen image edit model cache: $QWEN_IMAGE_EDIT_MODEL_REPO"
-      huggingface-cli download "$QWEN_IMAGE_EDIT_MODEL_REPO"
-    fi
+    echo "[entrypoint] SDXL/JANKU workflow enabled. Model files will be prefetched in the background."
+    prefetch_sdxl_models &
   else
     echo "[entrypoint] SDXL/JANKU workflow enabled. Model files will be downloaded on first use."
   fi
