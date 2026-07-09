@@ -186,10 +186,11 @@ For the `sdxl_janku` workflow, Civitai downloads can be unstable. Put the JANKU
 checkpoint in a private R2 bucket and point Vast.ai at that object:
 
 ```text
-JANKU_MODEL_PATH=/models/checkpoints/jankuV60.safetensors
+JANKU_MODEL_PATH=/models/checkpoints/JANKUTrainedChenkinNoobai_v777.safetensors
 JANKU_MODEL_URL=
-JANKU_R2_BUCKET=hidream-o1-model-cache
-JANKU_R2_KEY=models/jankuV60.safetensors
+JANKU_R2_BUCKET=ai-model-cache
+JANKU_R2_KEY=models/JANKUTrainedChenkinNoobai_v777.safetensors
+JANKU_MODEL_MIN_BYTES=6900000000
 R2_ENDPOINT_URL=https://<account-id>.r2.cloudflarestorage.com
 R2_ACCESS_KEY_ID=<r2-access-key>
 R2_SECRET_ACCESS_KEY=<r2-secret-key>
