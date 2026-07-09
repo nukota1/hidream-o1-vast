@@ -110,12 +110,13 @@ def _download_if_needed(path, url):
     print(f"[sdxl] Download complete: {path}")
 
 
-def _load_single_file_or_repo(pipeline_cls, model_ref, dtype):
+def _load_single_file_or_repo(pipeline_cls, model_ref, dtype, single_file_pipeline_cls=None):
     if not model_ref:
         raise RuntimeError("Model path/repo is not configured.")
     kwargs = {"torch_dtype": dtype, "use_safetensors": True}
     if os.path.isfile(model_ref):
-        pipe = pipeline_cls.from_single_file(model_ref, **kwargs)
+        cls = single_file_pipeline_cls or pipeline_cls
+        pipe = cls.from_single_file(model_ref, **kwargs)
     elif model_ref.endswith((".safetensors", ".ckpt")):
         raise RuntimeError(f"Model file does not exist: {model_ref}")
     else:
@@ -133,13 +134,18 @@ def _load_single_file_or_repo(pipeline_cls, model_ref, dtype):
 
 
 def load_janku_pipeline():
-    from diffusers import AutoPipelineForText2Image
+    from diffusers import AutoPipelineForText2Image, StableDiffusionXLPipeline
 
     model_path = os.environ.get("JANKU_MODEL_PATH", "")
     _download_if_needed(model_path, os.environ.get("JANKU_MODEL_URL", ""))
     model_ref = model_path or os.environ.get("JANKU_MODEL_REPO")
     print(f"[sdxl] Loading JANKU text-to-image model: {model_ref}")
-    return _load_single_file_or_repo(AutoPipelineForText2Image, model_ref, _torch_dtype())
+    return _load_single_file_or_repo(
+        AutoPipelineForText2Image,
+        model_ref,
+        _torch_dtype(),
+        single_file_pipeline_cls=StableDiffusionXLPipeline,
+    )
 
 
 def load_qwen_edit_pipeline():
