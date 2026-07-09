@@ -15,6 +15,11 @@ set -euo pipefail
 : "${SDXL_DOWNLOAD_ON_START:=1}"
 : "${QWEN_IMAGE_EDIT_MODEL_REPO:=Qwen/Qwen-Image-Edit-2511}"
 : "${QWEN_IMAGE_EDIT_DOWNLOAD_ON_START:=1}"
+: "${MODEL_DOWNLOAD_RETRIES:=30}"
+: "${MODEL_DOWNLOAD_RETRY_DELAY:=10}"
+: "${MODEL_DOWNLOAD_CONNECT_TIMEOUT:=60}"
+: "${MODEL_DOWNLOAD_LOW_SPEED_TIME:=900}"
+: "${MODEL_DOWNLOAD_LOW_SPEED_LIMIT:=1024}"
 
 export HF_HOME
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME}"
@@ -55,12 +60,12 @@ curl_download() {
   local output="$2"
   shift 2
   curl -fL \
-    --retry 8 \
+    --retry "$MODEL_DOWNLOAD_RETRIES" \
     --retry-all-errors \
-    --retry-delay 5 \
-    --connect-timeout 30 \
-    --speed-time 120 \
-    --speed-limit 1024 \
+    --retry-delay "$MODEL_DOWNLOAD_RETRY_DELAY" \
+    --connect-timeout "$MODEL_DOWNLOAD_CONNECT_TIMEOUT" \
+    --speed-time "$MODEL_DOWNLOAD_LOW_SPEED_TIME" \
+    --speed-limit "$MODEL_DOWNLOAD_LOW_SPEED_LIMIT" \
     --continue-at - \
     "$@" \
     "$url" \
