@@ -33,9 +33,45 @@ def _negative_prompt():
     )
 
 
+def _min_janku_bytes():
+    try:
+        return int(os.environ.get("JANKU_MODEL_MIN_BYTES", "6000000000"))
+    except ValueError:
+        return 6000000000
+
+
+def _is_complete_file(path, min_bytes):
+    if not path or not os.path.isfile(path):
+        return False
+    if min_bytes <= 0:
+        return True
+    actual_bytes = os.path.getsize(path)
+    if actual_bytes < min_bytes:
+        print(f"[sdxl] Incomplete model file detected: {path} ({actual_bytes}/{min_bytes} bytes)")
+        return False
+    return True
+
+
+def _download_url(url, tmp_path, token):
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        return urllib.request.urlopen(req, timeout=3600)
+    except Exception:
+        if not token:
+            raise
+        sep = "&" if "?" in url else "?"
+        return urllib.request.urlopen(f"{url}{sep}token={token}", timeout=3600)
+
+
 def _download_if_needed(path, url):
-    if not path or not url or os.path.isfile(path):
+    if not path or not url:
         return
+    min_bytes = _min_janku_bytes()
+    if _is_complete_file(path, min_bytes):
+        return
+    if os.path.isfile(path):
+        os.remove(path)
     tmp_path = f"{path}.part"
     wait_seconds = int(os.environ.get("SDXL_DOWNLOAD_WAIT_SECONDS", "7200"))
     waited = 0
@@ -46,22 +82,14 @@ def _download_if_needed(path, url):
             raise RuntimeError(f"Timed out waiting for background download: {path}")
         time.sleep(5)
         waited += 5
-    if os.path.isfile(path):
+    if _is_complete_file(path, min_bytes):
         return
+    if os.path.isfile(path):
+        os.remove(path)
     print(f"[sdxl] Downloading model to {path}")
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    headers = {}
     token = os.environ.get("CIVITAI_TOKEN", "")
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        response = urllib.request.urlopen(req, timeout=3600)
-    except Exception:
-        if not token:
-            raise
-        sep = "&" if "?" in url else "?"
-        response = urllib.request.urlopen(f"{url}{sep}token={token}", timeout=3600)
+    response = _download_url(url, tmp_path, token)
     try:
         with response:
             with open(tmp_path, "wb") as f:
@@ -70,6 +98,8 @@ def _download_if_needed(path, url):
                     if not chunk:
                         break
                     f.write(chunk)
+        if not _is_complete_file(tmp_path, min_bytes):
+            raise RuntimeError(f"Downloaded model is smaller than expected: {tmp_path}")
         os.replace(tmp_path, path)
     except Exception:
         try:
