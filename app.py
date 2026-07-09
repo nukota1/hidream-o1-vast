@@ -1644,7 +1644,13 @@ def api_generate_start():
                         _STATE["qwen_edit_pipe"] = None
                         clear_cuda()
                         if _STATE["janku_pipe"] is None:
-                            _STATE["janku_pipe"] = load_janku_pipeline()
+                            def janku_status(message):
+                                q.put({
+                                    "type": "status",
+                                    "phase": "generate",
+                                    "message": message,
+                                })
+                            _STATE["janku_pipe"] = load_janku_pipeline(status_callback=janku_status)
                         image = generate_with_janku(
                             _STATE["janku_pipe"],
                             optimized_prompt,

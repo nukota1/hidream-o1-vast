@@ -52,6 +52,24 @@ def _is_complete_file(path, min_bytes):
     return True
 
 
+def _format_bytes(num_bytes):
+    if num_bytes >= 1024 * 1024 * 1024:
+        return f"{num_bytes / (1024 * 1024 * 1024):.2f} GB"
+    if num_bytes >= 1024 * 1024:
+        return f"{num_bytes / (1024 * 1024):.0f} MB"
+    return f"{num_bytes} bytes"
+
+
+def _download_status_message(path, tmp_path, min_bytes, waited):
+    current_path = path if os.path.isfile(path) else tmp_path
+    actual_bytes = os.path.getsize(current_path) if os.path.isfile(current_path) else 0
+    target = f" / at least {_format_bytes(min_bytes)}" if min_bytes > 0 else ""
+    return (
+        f"Waiting for JANKU model download: {_format_bytes(actual_bytes)}{target} "
+        f"({waited}s elapsed)"
+    )
+
+
 def _download_url(url, tmp_path, token):
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     req = urllib.request.Request(url, headers=headers)
@@ -64,7 +82,7 @@ def _download_url(url, tmp_path, token):
         return urllib.request.urlopen(f"{url}{sep}token={token}", timeout=3600)
 
 
-def _download_if_needed(path, url):
+def _download_if_needed(path, url, status_callback=None):
     if not path or not url:
         return
     min_bytes = _min_janku_bytes()
@@ -78,6 +96,8 @@ def _download_if_needed(path, url):
     while os.path.isfile(tmp_path) and not os.path.isfile(path):
         if waited == 0:
             print(f"[sdxl] Waiting for background download: {path}")
+        if status_callback and waited % 10 == 0:
+            status_callback(_download_status_message(path, tmp_path, min_bytes, waited))
         if waited >= wait_seconds:
             raise RuntimeError(f"Timed out waiting for background download: {path}")
         time.sleep(5)
@@ -87,17 +107,23 @@ def _download_if_needed(path, url):
     if os.path.isfile(path):
         os.remove(path)
     print(f"[sdxl] Downloading model to {path}")
+    if status_callback:
+        status_callback("Downloading JANKU model before generation")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     token = os.environ.get("CIVITAI_TOKEN", "")
     response = _download_url(url, tmp_path, token)
     try:
         with response:
             with open(tmp_path, "wb") as f:
+                last_status_at = time.monotonic()
                 while True:
                     chunk = response.read(1024 * 1024)
                     if not chunk:
                         break
                     f.write(chunk)
+                    if status_callback and time.monotonic() - last_status_at >= 10:
+                        status_callback(_download_status_message(path, tmp_path, min_bytes, 0))
+                        last_status_at = time.monotonic()
         if not _is_complete_file(tmp_path, min_bytes):
             raise RuntimeError(f"Downloaded model is smaller than expected: {tmp_path}")
         os.replace(tmp_path, path)
@@ -108,6 +134,8 @@ def _download_if_needed(path, url):
             pass
         raise
     print(f"[sdxl] Download complete: {path}")
+    if status_callback:
+        status_callback("JANKU model download complete; loading model")
 
 
 def _load_single_file_or_repo(pipeline_cls, model_ref, dtype, single_file_pipeline_cls=None):
@@ -133,13 +161,15 @@ def _load_single_file_or_repo(pipeline_cls, model_ref, dtype, single_file_pipeli
     return pipe
 
 
-def load_janku_pipeline():
+def load_janku_pipeline(status_callback=None):
     from diffusers import AutoPipelineForText2Image, StableDiffusionXLPipeline
 
     model_path = os.environ.get("JANKU_MODEL_PATH", "")
-    _download_if_needed(model_path, os.environ.get("JANKU_MODEL_URL", ""))
+    _download_if_needed(model_path, os.environ.get("JANKU_MODEL_URL", ""), status_callback=status_callback)
     model_ref = model_path or os.environ.get("JANKU_MODEL_REPO")
     print(f"[sdxl] Loading JANKU text-to-image model: {model_ref}")
+    if status_callback:
+        status_callback("Loading JANKU model into GPU memory")
     return _load_single_file_or_repo(
         AutoPipelineForText2Image,
         model_ref,
