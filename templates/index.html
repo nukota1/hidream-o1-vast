@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JANKU Image Studio</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">JANKU Image Studio</div>
+    <div class="model-name">JANKU v7.77</div>
+  </header>
+
+  <div class="workspace">
+    <aside class="controls">
+      <div class="field">
+        <label for="prompt">作りたい画像</label>
+        <textarea id="prompt" rows="7" placeholder="キャラクター、服装、ポーズ、背景、画風などを日本語で入力"></textarea>
+      </div>
+
+      <div class="field">
+        <label for="preset">画風テンプレート</label>
+        <select id="preset">
+          {% for preset_id, preset in presets.items() %}
+          <option value="{{ preset_id }}" {% if preset_id == 'bishoujo_game' %}selected{% endif %}>{{ preset.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <label class="toggle-row" for="refine-enabled">
+        <span>
+          <strong>日本語プロンプトを自動最適化</strong>
+          <small>ローカルQwenでJANKU向け英語へ変換</small>
+        </span>
+        <input id="refine-enabled" type="checkbox" {% if refine_default %}checked{% endif %}>
+      </label>
+
+      <details open>
+        <summary>画風の強さ</summary>
+        <div class="slider-field">
+          <label for="anime-strength">アニメ・美少女ゲーム風 <output id="anime-strength-value"></output></label>
+          <input id="anime-strength" type="range" min="0" max="100">
+        </div>
+        <div class="slider-field">
+          <label for="line-detail">線画・描き込み <output id="line-detail-value"></output></label>
+          <input id="line-detail" type="range" min="0" max="100">
+        </div>
+        <div class="slider-field">
+          <label for="color-vividness">色の鮮やかさ <output id="color-vividness-value"></output></label>
+          <input id="color-vividness" type="range" min="0" max="100">
+        </div>
+        <div class="slider-field">
+          <label for="background-mood">背景の雰囲気 <output id="background-mood-value"></output></label>
+          <input id="background-mood" type="range" min="0" max="100">
+        </div>
+        <div class="slider-field">
+          <label for="photoreal-avoidance">実写化を避ける強さ <output id="photoreal-avoidance-value"></output></label>
+          <input id="photoreal-avoidance" type="range" min="0" max="100">
+        </div>
+      </details>
+
+      <details>
+        <summary>詳細設定</summary>
+        <div class="field-grid">
+          <div class="field">
+            <label for="width">幅</label>
+            <input id="width" type="number" min="512" max="2048" step="64">
+          </div>
+          <div class="field">
+            <label for="height">高さ</label>
+            <input id="height" type="number" min="512" max="2048" step="64">
+          </div>
+          <div class="field">
+            <label for="steps">Steps</label>
+            <input id="steps" type="number" min="10" max="60" step="1">
+          </div>
+          <div class="field">
+            <label for="cfg">CFG</label>
+            <input id="cfg" type="number" min="1" max="12" step="0.5">
+          </div>
+          <div class="field">
+            <label for="sampler">Sampler</label>
+            <select id="sampler">
+              <option value="euler_a">Euler A</option>
+              <option value="euler">Euler</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="clip-skip">Clip Skip</label>
+            <input id="clip-skip" type="number" min="1" max="4" step="1">
+          </div>
+        </div>
+        <div class="field">
+          <label for="seed">Seed</label>
+          <input id="seed" type="number" min="0" value="32">
+        </div>
+        <div class="field">
+          <label for="negative-prompt">Negative prompt</label>
+          <textarea id="negative-prompt" rows="4"></textarea>
+        </div>
+      </details>
+
+      <button id="generate" class="primary-command" type="button">画像を生成</button>
+      <div id="error" class="error" hidden></div>
+    </aside>
+
+    <main class="result-area">
+      <div id="empty" class="empty-state">
+        <div class="empty-mark">J</div>
+        <p>生成した画像がここに表示されます</p>
+      </div>
+
+      <section id="progress" class="progress-area" hidden>
+        <div class="progress-copy">
+          <strong id="progress-title">準備中</strong>
+          <span id="progress-message"></span>
+        </div>
+        <div class="progress-track"><div id="progress-fill"></div></div>
+      </section>
+
+      <section id="result" hidden>
+        <div class="image-stage"><img id="result-image" alt="生成画像"></div>
+        <div class="result-toolbar">
+          <button id="download" type="button">画像を保存</button>
+          <button id="save-r2" type="button">R2に保存</button>
+        </div>
+        <details class="prompt-result">
+          <summary>生成に使用したプロンプト</summary>
+          <pre id="optimized-prompt"></pre>
+        </details>
+
+        <section class="edit-section">
+          <h2>画像を修正</h2>
+          <div id="edit-history" class="edit-history"></div>
+          <div class="field">
+            <label for="edit-prompt">修正内容</label>
+            <textarea id="edit-prompt" rows="4" placeholder="表情を笑顔にして、背景の雨を強くする"></textarea>
+          </div>
+          <div class="field">
+            <label for="edit-mask">編集マスク（任意）</label>
+            <input id="edit-mask" type="file" accept="image/*">
+          </div>
+          <button id="edit" class="primary-command" type="button">この画像を修正</button>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <script id="preset-data" type="application/json">{{ presets_json|safe }}</script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

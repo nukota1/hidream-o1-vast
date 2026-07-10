@@ -1,4 +1,4 @@
-name = "hidream-o1-web"
+name = "janku-image-studio"
 main = "src/index.ts"
 compatibility_date = "2026-07-01"
 

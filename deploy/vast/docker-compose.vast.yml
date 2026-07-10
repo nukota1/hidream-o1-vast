@@ -1,16 +1,16 @@
 services:
-  hidream-o1:
+  janku-studio:
     image: ghcr.io/YOUR_GITHUB_OWNER/hidream-o1-image:latest
-    container_name: hidream-o1-image
+    container_name: janku-image-studio
     ports:
       - "7861:7861"
     env_file:
       - ./env.vast
     environment:
-      HIDREAM_HOST: 0.0.0.0
-      HIDREAM_PORT: 7861
+      APP_HOST: 0.0.0.0
+      APP_PORT: 7861
     volumes:
-      - /workspace/hidream-o1-models:/models
+      - /workspace/janku-models:/models
     deploy:
       resources:
         reservations:

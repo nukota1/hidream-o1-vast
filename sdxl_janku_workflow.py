@@ -1,13 +1,12 @@
 import os
 import time
-import urllib.request
 
 import torch
 from PIL import Image
 
 
 def _torch_dtype():
-    dtype_name = os.environ.get("SDXL_TORCH_DTYPE", os.environ.get("HIDREAM_TORCH_DTYPE", "auto")).lower()
+    dtype_name = os.environ.get("MODEL_TORCH_DTYPE", "auto").lower()
     if dtype_name == "auto":
         device_name = torch.cuda.get_device_name(0).lower() if torch.cuda.is_available() else ""
         dtype_name = "float16" if "v100" in device_name or "tesla v100" in device_name else "bfloat16"
@@ -25,19 +24,11 @@ def _device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def _negative_prompt():
-    return os.environ.get(
-        "SDXL_NEGATIVE_PROMPT",
-        "lowres, worst quality, low quality, bad anatomy, bad hands, extra fingers, "
-        "missing fingers, blurry, jpeg artifacts, watermark, signature, text",
-    )
-
-
 def _min_janku_bytes():
     try:
-        return int(os.environ.get("JANKU_MODEL_MIN_BYTES", "6000000000"))
+        return int(os.environ.get("JANKU_MODEL_MIN_BYTES", "6900000000"))
     except ValueError:
-        return 6000000000
+        return 6900000000
 
 
 def _is_complete_file(path, min_bytes):
@@ -134,29 +125,18 @@ def _download_from_r2(path, tmp_path, min_bytes, status_callback=None):
         status_callback("JANKU model download from R2 complete; loading model")
 
 
-def _download_url(url, tmp_path, token):
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        return urllib.request.urlopen(req, timeout=3600)
-    except Exception:
-        if not token:
-            raise
-        sep = "&" if "?" in url else "?"
-        return urllib.request.urlopen(f"{url}{sep}token={token}", timeout=3600)
-
-
-def _download_if_needed(path, url, status_callback=None):
-    r2_configured = _r2_config() is not None
-    if not path or (not url and not r2_configured):
+def _download_if_needed(path, status_callback=None):
+    if not path:
         return
+    if _r2_config() is None:
+        raise RuntimeError("JANKU_R2_BUCKET and JANKU_R2_KEY are required.")
     min_bytes = _min_janku_bytes()
     if _is_complete_file(path, min_bytes):
         return
     if os.path.isfile(path):
         os.remove(path)
     tmp_path = f"{path}.part"
-    wait_seconds = int(os.environ.get("SDXL_DOWNLOAD_WAIT_SECONDS", "7200"))
+    wait_seconds = int(os.environ.get("MODEL_DOWNLOAD_WAIT_SECONDS", "7200"))
     waited = 0
     while os.path.isfile(tmp_path) and not os.path.isfile(path):
         if waited == 0:
@@ -173,47 +153,16 @@ def _download_if_needed(path, url, status_callback=None):
         os.remove(path)
     print(f"[sdxl] Downloading model to {path}")
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    if r2_configured:
-        if status_callback:
-            status_callback("Downloading JANKU model from R2 before generation")
-        try:
-            _download_from_r2(path, tmp_path, min_bytes, status_callback=status_callback)
-        except Exception:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-            raise
-        return
-
     if status_callback:
-        status_callback("Downloading JANKU model before generation")
-    token = os.environ.get("CIVITAI_TOKEN", "")
-    response = _download_url(url, tmp_path, token)
+        status_callback("Downloading JANKU model from R2 before generation")
     try:
-        with response:
-            with open(tmp_path, "wb") as f:
-                last_status_at = time.monotonic()
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    if status_callback and time.monotonic() - last_status_at >= 10:
-                        status_callback(_download_status_message(path, tmp_path, min_bytes, 0))
-                        last_status_at = time.monotonic()
-        if not _is_complete_file(tmp_path, min_bytes):
-            raise RuntimeError(f"Downloaded model is smaller than expected: {tmp_path}")
-        os.replace(tmp_path, path)
+        _download_from_r2(path, tmp_path, min_bytes, status_callback=status_callback)
     except Exception:
         try:
             os.remove(tmp_path)
         except OSError:
             pass
         raise
-    print(f"[sdxl] Download complete: {path}")
-    if status_callback:
-        status_callback("JANKU model download complete; loading model")
 
 
 def _load_single_file_or_repo(pipeline_cls, model_ref, dtype, single_file_pipeline_cls=None):
@@ -243,8 +192,8 @@ def load_janku_pipeline(status_callback=None):
     from diffusers import AutoPipelineForText2Image, StableDiffusionXLPipeline
 
     model_path = os.environ.get("JANKU_MODEL_PATH", "")
-    _download_if_needed(model_path, os.environ.get("JANKU_MODEL_URL", ""), status_callback=status_callback)
-    model_ref = model_path or os.environ.get("JANKU_MODEL_REPO")
+    _download_if_needed(model_path, status_callback=status_callback)
+    model_ref = model_path
     print(f"[sdxl] Loading JANKU text-to-image model: {model_ref}")
     if status_callback:
         status_callback("Loading JANKU model into GPU memory")
@@ -259,7 +208,7 @@ def load_janku_pipeline(status_callback=None):
 def load_qwen_edit_pipeline():
     from diffusers import QwenImageEditPlusPipeline
 
-    model_ref = os.environ.get("QWEN_IMAGE_EDIT_MODEL_REPO", "Qwen/Qwen-Image-Edit-2511")
+    model_ref = os.environ.get("QWEN_IMAGE_EDIT_MODEL", "Qwen/Qwen-Image-Edit-2511")
     print(f"[qwen-edit] Loading image edit model: {model_ref}")
     pipe = QwenImageEditPlusPipeline.from_pretrained(model_ref, torch_dtype=_torch_dtype())
     pipe = pipe.to(_device())
@@ -274,28 +223,37 @@ def _generator(seed):
     return torch.Generator(device=_device()).manual_seed(int(seed))
 
 
-def generate_with_janku(pipe, prompt, width, height, seed, callback=None):
-    steps = int(os.environ.get("JANKU_STEPS", "28"))
-    guidance_scale = float(os.environ.get("JANKU_CFG_SCALE", "5"))
+def _set_sampler(pipe, sampler):
+    from diffusers import EulerAncestralDiscreteScheduler, EulerDiscreteScheduler
+
+    scheduler_cls = EulerAncestralDiscreteScheduler if sampler == "euler_a" else EulerDiscreteScheduler
+    pipe.scheduler = scheduler_cls.from_config(pipe.scheduler.config, timestep_spacing="linspace")
+
+
+def generate_with_janku(pipe, prompt, settings, callback=None):
+    steps = int(settings["steps"])
+    _set_sampler(pipe, settings["sampler"])
+
+    def on_step_end(_pipe, step, _timestep, callback_kwargs):
+        if callback:
+            callback(step, steps)
+        return callback_kwargs
+
     image = pipe(
         prompt=prompt,
-        negative_prompt=_negative_prompt(),
-        width=width,
-        height=height,
+        negative_prompt=settings["negative_prompt"],
+        width=int(settings["width"]),
+        height=int(settings["height"]),
         num_inference_steps=steps,
-        guidance_scale=guidance_scale,
-        generator=_generator(seed),
+        guidance_scale=float(settings["cfg"]),
+        clip_skip=int(settings["clip_skip"]),
+        generator=_generator(settings["seed"]),
+        callback_on_step_end=on_step_end,
     ).images[0]
-    if callback:
-        callback(steps - 1, steps)
     return image
 
 
-def _full_mask(size):
-    return Image.new("L", size, 255)
-
-
-def edit_with_qwen_image_edit(pipe, prompt, image_path, mask_path, width, height, seed, callback=None):
+def edit_with_qwen_image_edit(pipe, prompt, image_path, mask_path, seed, callback=None):
     source = Image.open(image_path).convert("RGB")
     images = [source]
     edit_prompt = prompt
@@ -310,6 +268,12 @@ def edit_with_qwen_image_edit(pipe, prompt, image_path, mask_path, width, height
     true_cfg_scale = float(os.environ.get("QWEN_IMAGE_EDIT_TRUE_CFG_SCALE", "4.0"))
     guidance_scale = float(os.environ.get("QWEN_IMAGE_EDIT_GUIDANCE_SCALE", "1.0"))
     negative_prompt = os.environ.get("QWEN_IMAGE_EDIT_NEGATIVE_PROMPT", " ")
+
+    def on_step_end(_pipe, step, _timestep, callback_kwargs):
+        if callback:
+            callback(step, steps)
+        return callback_kwargs
+
     result = pipe(
         image=images,
         prompt=edit_prompt,
@@ -319,7 +283,6 @@ def edit_with_qwen_image_edit(pipe, prompt, image_path, mask_path, width, height
         num_inference_steps=steps,
         guidance_scale=guidance_scale,
         num_images_per_prompt=1,
+        callback_on_step_end=on_step_end,
     )
-    if callback:
-        callback(steps - 1, steps)
     return result.images[0]

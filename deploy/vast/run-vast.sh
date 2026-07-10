@@ -2,10 +2,10 @@
 set -euo pipefail
 
 IMAGE="${1:-ghcr.io/YOUR_GITHUB_OWNER/hidream-o1-image:latest}"
-NAME="${CONTAINER_NAME:-hidream-o1-image}"
-MODEL_DIR="${MODEL_DIR:-/workspace/hidream-o1-models}"
+NAME="${CONTAINER_NAME:-janku-image-studio}"
+MODEL_DIR="${MODEL_DIR:-/workspace/janku-models}"
 ENV_FILE="${ENV_FILE:-./env.vast}"
-PORT="${HIDREAM_PORT:-7861}"
+PORT="${APP_PORT:-7861}"
 
 mkdir -p "$MODEL_DIR"
 
