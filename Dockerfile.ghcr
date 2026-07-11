@@ -21,6 +21,13 @@ COPY requirements-docker.txt /tmp/requirements-docker.txt
 RUN python -m pip install --no-cache-dir --upgrade pip \
     && python -m pip install --no-cache-dir -r /tmp/requirements-docker.txt
 
+# HiDream code is included for the optional editor workflow. Model weights stay
+# outside the image and are fetched only after the user selects this editor.
+RUN git clone --depth 1 https://github.com/HiDream-ai/HiDream-O1-Image.git /opt/hidream-o1-image \
+    && sed -E '/^(torch|torchvision|transformers|flash-attn)/d' /opt/hidream-o1-image/requirements.txt > /tmp/hidream-requirements.txt \
+    && python -m pip install --no-cache-dir -r /tmp/hidream-requirements.txt \
+    && sed -i 's/"use_flash_attn": True/"use_flash_attn": False/' /opt/hidream-o1-image/models/pipeline.py
+
 COPY . /workspace/janku-image-studio
 RUN chmod +x /workspace/janku-image-studio/deploy/vast/entrypoint.sh
 

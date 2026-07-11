@@ -30,8 +30,8 @@
 
       <label class="toggle-row" for="refine-enabled">
         <span>
-          <strong>日本語プロンプトを自動最適化</strong>
-          <small>ローカルQwenでJANKU向け英語へ変換</small>
+          <strong>構図と表現をAIで補完</strong>
+          <small>OFFでも日本語から英語タグへの変換は実行します</small>
         </span>
         <input id="refine-enabled" type="checkbox" {% if refine_default %}checked{% endif %}>
       </label>
@@ -134,12 +134,26 @@
           <h2>画像を修正</h2>
           <div id="edit-history" class="edit-history"></div>
           <div class="field">
+            <label for="edit-model">画像編集モデル</label>
+            <select id="edit-model">
+              {% for editor_id, editor in editor_models.items() %}
+              <option value="{{ editor_id }}" {% if editor_id == 'waifu_inpaint_xl' %}selected{% endif %}>{{ editor.label }}</option>
+              {% endfor %}
+            </select>
+            <small id="edit-model-description">{{ editor_models['waifu_inpaint_xl'].description }}</small>
+          </div>
+          <div class="field">
             <label for="edit-prompt">修正内容</label>
             <textarea id="edit-prompt" rows="4" placeholder="表情を笑顔にして、背景の雨を強くする"></textarea>
           </div>
           <div class="field">
             <label for="edit-mask">編集マスク（任意）</label>
             <input id="edit-mask" type="file" accept="image/*">
+          </div>
+          <div class="slider-field">
+            <label for="edit-strength">編集の強さ <output id="edit-strength-value">55</output></label>
+            <input id="edit-strength" type="range" min="10" max="95" value="55" step="5">
+            <small>低いほど元画像を保持し、高いほど指示を強く反映します</small>
           </div>
           <button id="edit" class="primary-command" type="button">この画像を修正</button>
         </section>
@@ -148,6 +162,7 @@
   </div>
 
   <script id="preset-data" type="application/json">{{ presets_json|safe }}</script>
+  <script id="edit-model-data" type="application/json">{{ editor_models_json|safe }}</script>
   <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>

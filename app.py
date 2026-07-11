@@ -5,21 +5,24 @@ import io
 import json
 import os
 import queue
+import re
 import tempfile
 import threading
+import traceback
 import uuid
 from datetime import datetime, timezone
 
 import torch
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template, request
+from PIL import ImageEnhance
 
+from image_edit_workflows import EDITOR_MODELS, edit_image, editor_model_choices, load_editor_pipeline, unload_editor
 from prompt_refiner import LocalPromptRefiner
 from sdxl_janku_workflow import (
-    edit_with_qwen_image_edit,
+    fit_prompt_for_sdxl,
     generate_with_janku,
     load_janku_pipeline,
-    load_qwen_edit_pipeline,
 )
 
 load_dotenv()
@@ -29,7 +32,8 @@ _GEN_LOCK = threading.Lock()
 _JOBS = {}
 _STATE = {
     "janku_pipe": None,
-    "qwen_edit_pipe": None,
+    "editor_pipe": None,
+    "editor_id": None,
     "refiner": LocalPromptRefiner(),
 }
 
@@ -42,17 +46,32 @@ STYLE_PRESETS = {
     "bishoujo_game": {
         "label": "美少女ゲーム風",
         "prompt_hint": (
-            "2D Japanese bishoujo visual novel game CG, polished character design, "
-            "clean expressive eyes, finely rendered hair, crisp line art, detailed scenic background"
+            "soft luminous Japanese bishoujo game CG, gentle low-contrast pastel rendering"
         ),
-        "width": 1216,
-        "height": 832,
-        "steps": 28,
-        "cfg": 4.5,
-        "sampler": "euler_a",
+        "positive_style_tags": [
+            "soft luminous bishoujo game CG",
+            "gentle low contrast",
+            "diffuse overcast lighting",
+        ],
+        "negative_style_tags": [
+            "harsh contrast",
+            "dramatic shadows",
+            "underexposed",
+            "crushed blacks",
+            "heavy black outlines",
+            "hard cel shading",
+            "sunny",
+            "clear sky",
+            "direct sunlight",
+        ],
+        "width": 832,
+        "height": 1216,
+        "steps": 32,
+        "cfg": 5.0,
+        "sampler": "euler",
         "clip_skip": 2,
         "negative_prompt": BASE_NEGATIVE_PROMPT + ", photorealistic, live action, 3d render",
-        "style": {"anime_strength": 90, "line_detail": 80, "color_vividness": 72, "background_mood": 68, "photoreal_avoidance": 95},
+        "style": {"anime_strength": 90, "line_detail": 60, "color_vividness": 65, "background_mood": 82, "photoreal_avoidance": 95},
     },
     "anime_illustration": {
         "label": "アニメイラスト",
@@ -62,9 +81,9 @@ STYLE_PRESETS = {
         ),
         "width": 832,
         "height": 1216,
-        "steps": 28,
-        "cfg": 4.5,
-        "sampler": "euler_a",
+        "steps": 32,
+        "cfg": 5.0,
+        "sampler": "euler",
         "clip_skip": 2,
         "negative_prompt": BASE_NEGATIVE_PROMPT + ", photorealistic, live action",
         "style": {"anime_strength": 88, "line_detail": 72, "color_vividness": 78, "background_mood": 55, "photoreal_avoidance": 92},
@@ -92,9 +111,9 @@ STYLE_PRESETS = {
         ),
         "width": 832,
         "height": 1216,
-        "steps": 28,
-        "cfg": 4.5,
-        "sampler": "euler_a",
+        "steps": 32,
+        "cfg": 5.0,
+        "sampler": "euler",
         "clip_skip": 2,
         "negative_prompt": BASE_NEGATIVE_PROMPT + ", photorealistic, live action, 3d render",
         "style": {"anime_strength": 88, "line_detail": 82, "color_vividness": 68, "background_mood": 66, "photoreal_avoidance": 94},
@@ -104,9 +123,9 @@ STYLE_PRESETS = {
         "prompt_hint": "",
         "width": 1024,
         "height": 1024,
-        "steps": 28,
-        "cfg": 4.5,
-        "sampler": "euler_a",
+        "steps": 32,
+        "cfg": 5.0,
+        "sampler": "euler",
         "clip_skip": 2,
         "negative_prompt": BASE_NEGATIVE_PROMPT,
         "style": {"anime_strength": 70, "line_detail": 70, "color_vividness": 65, "background_mood": 60, "photoreal_avoidance": 80},
@@ -149,6 +168,8 @@ def normalize_generation_settings(data):
     sampler = data.get("sampler", preset["sampler"])
     if sampler not in {"euler_a", "euler"}:
         sampler = preset["sampler"]
+    style = normalize_style_settings(data.get("style_settings"), preset["style"])
+    negative_prompt = str(data.get("negative_prompt") or preset["negative_prompt"]).strip()
     return {
         "preset": preset_id,
         "width": normalize_dimension(data.get("width"), preset["width"]),
@@ -158,8 +179,13 @@ def normalize_generation_settings(data):
         "sampler": sampler,
         "clip_skip": clamp_int(data.get("clip_skip"), preset["clip_skip"], 1, 4),
         "seed": clamp_int(data.get("seed"), 32, 0, 2**31 - 1),
-        "negative_prompt": str(data.get("negative_prompt") or preset["negative_prompt"]).strip(),
-        "style": normalize_style_settings(data.get("style_settings"), preset["style"]),
+        "negative_prompt": style_negative_prompt(
+            negative_prompt,
+            style,
+            preset["style"],
+            preset.get("negative_style_tags", []),
+        ),
+        "style": style,
     }
 
 
@@ -190,39 +216,176 @@ def deterministic_style_hint(style):
     return ", ".join(hints)
 
 
+def _style_tier(value):
+    if value >= 80:
+        return "high"
+    if value >= 55:
+        return "normal"
+    if value >= 30:
+        return "low"
+    return "minimal"
+
+
+def style_adjustment_tags(style, preset_style):
+    """Return only intentional deviations from the selected style preset."""
+    definitions = {
+        "anime_strength": {
+            "high": "anime visual novel CG",
+            "normal": "anime illustration",
+            "low": "semi-realistic illustration",
+            "minimal": "painterly illustration",
+        },
+        "line_detail": {
+            "high": "intricate crisp line art",
+            "normal": "clean line art",
+            "low": "soft line art",
+            "minimal": "painterly soft edges",
+        },
+        "color_vividness": {
+            "high": "vivid saturated colors",
+            "normal": "balanced colors",
+            "low": "restrained colors",
+            "minimal": "muted limited palette",
+        },
+        "background_mood": {
+            "high": "detailed atmospheric background",
+            "normal": "atmospheric background",
+            "low": "simple background",
+            "minimal": "minimal background",
+        },
+        "photoreal_avoidance": {
+            "high": "2D anime illustration",
+            "normal": "2D illustration",
+            "low": "illustration",
+            "minimal": "semi-realistic illustration",
+        },
+    }
+    tags = []
+    for key, tiers in definitions.items():
+        selected = _style_tier(style[key])
+        baseline = _style_tier(preset_style[key])
+        if selected != baseline:
+            tags.append(tiers[selected])
+    return tags
+
+
+def style_negative_prompt(negative_prompt, style, preset_style, preset_negative_tags=()):
+    """Make each style control affect diffusion conditioning, not just the refiner."""
+    additions = list(preset_negative_tags)
+    if _style_tier(style["anime_strength"]) != _style_tier(preset_style["anime_strength"]):
+        if style["anime_strength"] < 55:
+            additions.extend(["chibi", "flat cel shading"])
+    if style["line_detail"] < 30:
+        additions.extend(["heavy lineart", "sharp outlines"])
+    elif style["line_detail"] >= 80 and preset_style["line_detail"] < 80:
+        additions.extend(["soft focus", "blurry outlines"])
+    if style["color_vividness"] < 30:
+        additions.extend(["oversaturated", "neon colors"])
+    elif style["color_vividness"] >= 80 and preset_style["color_vividness"] < 80:
+        additions.extend(["monochrome", "desaturated"])
+    if style["background_mood"] < 30:
+        additions.extend(["detailed scenery", "busy background"])
+    elif style["background_mood"] >= 80 and preset_style["background_mood"] < 80:
+        additions.extend(["empty background", "plain background"])
+    if style["photoreal_avoidance"] >= 55:
+        additions.extend(["photorealistic", "live action", "3d render"])
+
+    tags = []
+    for tag in (item.strip() for item in [*negative_prompt.split(","), *additions] if item.strip()):
+        if tag.lower() not in {item.lower() for item in tags}:
+            tags.append(tag)
+    return ", ".join(tags)
+
+
+def apply_image_style_tone(image, settings):
+    """Apply the selected presentation controls after diffusion has finished."""
+    if settings["preset"] != "bishoujo_game":
+        return image
+
+    style = settings["style"]
+    # JANKU tends toward hard shadows. The game-CG preset deliberately keeps
+    # the character readable under a rainy, overcast scene.
+    image = ImageEnhance.Brightness(image).enhance(1.08)
+    image = ImageEnhance.Contrast(image).enhance(0.82)
+    image = ImageEnhance.Color(image).enhance(0.55 + (style["color_vividness"] * 0.007))
+    image = ImageEnhance.Sharpness(image).enhance(0.55 + (style["line_detail"] * 0.0075))
+    return image
+
+
 def prepare_prompt(user_prompt, mode, settings, refine_enabled):
     preset = STYLE_PRESETS[settings["preset"]]
-    if refine_enabled:
+    adjustment_tags = style_adjustment_tags(settings["style"], preset["style"]) if mode == "t2i" else []
+    preset_style_tags = preset.get("positive_style_tags", []) if mode == "t2i" else []
+    # A broad preset is useful guidance, but detailed preset prose must not
+    # displace the user's concrete visual requirements in SDXL's CLIP window.
+    refiner_preset_hint = preset["prompt_hint"] if mode == "t2i" else "preserve source image style"
+    style_description = describe_style(settings["style"]) if mode == "t2i" else "preserve source image style; no restyling"
+    contains_japanese = bool(re.search(r"[\u3040-\u30ff\u3400-\u9fff]", user_prompt))
+    if refine_enabled or contains_japanese:
         try:
-            return _STATE["refiner"].refine(
+            refined = _STATE["refiner"].refine(
                 user_prompt=user_prompt,
                 mode=mode,
                 preset_label=preset["label"],
-                preset_hint=preset["prompt_hint"],
-                style_description=describe_style(settings["style"]),
+                preset_hint=refiner_preset_hint,
+                style_description=style_description,
+                enhance=refine_enabled,
             )
+            if preset_style_tags or adjustment_tags:
+                # Keep the selected render direction and explicit adjustments
+                # ahead of the compacted request so SDXL actually receives them.
+                refined["prompt"] = ", ".join([*preset_style_tags, *adjustment_tags, refined["prompt"]])
+                refined["intent_notes"] = (
+                    f"{refined.get('intent_notes', '')} Applied style controls: "
+                    f"{', '.join([*preset_style_tags, *adjustment_tags])}."
+                ).strip()
+            return refined
         except Exception as exc:
             print(f"[refine] Local refinement failed: {exc}")
             source = "fallback"
             notes = f"Local refinement failed; deterministic style hints were used: {exc}"
-    else:
+    elif not refine_enabled:
         source = "disabled"
-        notes = "Prompt refinement was disabled by the user."
+        notes = "Prompt enhancement was disabled. The input was already English."
 
-    parts = [user_prompt]
-    if preset["prompt_hint"]:
+    # Keep the selected visual direction before the request in the fallback
+    # path so it survives the SDXL CLIP token limit.
+    parts = []
+    parts.extend(preset_style_tags)
+    if preset["prompt_hint"] and not preset_style_tags:
         parts.append(preset["prompt_hint"])
-    style_hint = deterministic_style_hint(settings["style"])
+    style_hint = ", ".join([*adjustment_tags, deterministic_style_hint(settings["style"])])
     if style_hint:
         parts.append(style_hint)
+    parts.append(user_prompt)
     return {"prompt": ", ".join(parts), "intent_notes": notes, "source": source}
 
 
 def unload_pipeline(name):
+    pipe = _STATE.get(name)
     _STATE[name] = None
+    if pipe is not None:
+        for method_name in ("maybe_free_model_hooks", "remove_all_hooks"):
+            try:
+                getattr(pipe, method_name)()
+            except Exception:
+                pass
+        del pipe
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        except Exception as exc:
+            print(f"[cuda] Cache cleanup warning: {exc}")
+
+
+def unload_active_editor():
+    pipe = _STATE.get("editor_pipe")
+    _STATE["editor_pipe"] = None
+    _STATE["editor_id"] = None
+    unload_editor(pipe)
 
 
 def get_r2_client():
@@ -288,6 +451,8 @@ def index():
         "index.html",
         presets=STYLE_PRESETS,
         presets_json=json.dumps(STYLE_PRESETS, ensure_ascii=False),
+        editor_models=editor_model_choices(),
+        editor_models_json=json.dumps(editor_model_choices(), ensure_ascii=False),
         refine_default=refine_default,
     )
 
@@ -320,6 +485,10 @@ def api_generate_start():
     settings = normalize_generation_settings(data)
     refine_enabled = bool(data.get("refine_enabled", True))
     mask_b64 = str(data.get("mask_image") or "").strip()
+    edit_strength = clamp_float(data.get("edit_strength"), 0.55, 0.10, 0.95)
+    editor_id = str(data.get("editor_model") or "waifu_inpaint_xl")
+    if mode == "edit" and editor_id not in EDITOR_MODELS:
+        return jsonify({"error": f"Unknown image editor: {editor_id}"}), 400
     job_id = uuid.uuid4().hex
     q = queue.Queue()
     _JOBS[job_id] = q
@@ -329,6 +498,7 @@ def api_generate_start():
         try:
             q.put({"type": "status", "phase": "refine", "message": "プロンプトを準備しています"})
             prompt_info = prepare_prompt(prompt, mode, settings, refine_enabled)
+            _STATE["refiner"].unload_if_cuda()
             q.put({
                 "type": "optimized_prompt",
                 "phase": "handoff",
@@ -348,31 +518,52 @@ def api_generate_start():
                     if mask_b64:
                         mask_path = decode_image_to_temp(mask_b64, "janku_mask")
                         temp_paths.append(mask_path)
-                    q.put({"type": "status", "phase": "generate", "message": "Qwen Image Editを準備しています"})
+                    q.put({
+                        "type": "status",
+                        "phase": "generate",
+                        "message": f"{EDITOR_MODELS[editor_id]['label']} を準備しています",
+                    })
                     unload_pipeline("janku_pipe")
-                    if _STATE["qwen_edit_pipe"] is None:
-                        _STATE["qwen_edit_pipe"] = load_qwen_edit_pipeline()
-                    image = edit_with_qwen_image_edit(
-                        _STATE["qwen_edit_pipe"],
+                    if _STATE["editor_id"] != editor_id:
+                        unload_active_editor()
+                    if _STATE["editor_pipe"] is None:
+                        def editor_status(message):
+                            q.put({"type": "status", "phase": "generate", "message": message})
+                        _STATE["editor_pipe"] = load_editor_pipeline(editor_id, status_callback=editor_status)
+                        _STATE["editor_id"] = editor_id
+                    image = edit_image(
+                        editor_id,
+                        _STATE["editor_pipe"],
                         prompt_info["prompt"],
                         source_path,
                         mask_path,
                         settings["seed"],
+                        strength=edit_strength,
                         callback=progress,
+                        status_callback=lambda message: q.put({"type": "status", "phase": "generate", "message": message}),
                     )
                 else:
                     q.put({"type": "status", "phase": "generate", "message": "JANKU v7.77を準備しています"})
-                    unload_pipeline("qwen_edit_pipe")
+                    unload_active_editor()
                     if _STATE["janku_pipe"] is None:
                         def model_status(message):
                             q.put({"type": "status", "phase": "generate", "message": message})
                         _STATE["janku_pipe"] = load_janku_pipeline(status_callback=model_status)
+                    fitted_prompt = fit_prompt_for_sdxl(_STATE["janku_pipe"], prompt_info["prompt"])
+                    if fitted_prompt != prompt_info["prompt"]:
+                        prompt_info["prompt"] = fitted_prompt
+                        q.put({
+                            "type": "status",
+                            "phase": "generate",
+                            "message": "重要な要素を優先し、モデルに収まる長さへプロンプトを最適化しました",
+                        })
                     image = generate_with_janku(
                         _STATE["janku_pipe"],
                         prompt_info["prompt"],
                         settings,
                         callback=progress,
                     )
+                    image = apply_image_style_tone(image, settings)
 
             buf = io.BytesIO()
             image.save(buf, format="PNG")
@@ -384,9 +575,12 @@ def api_generate_start():
                 "optimizer_source": prompt_info.get("source", ""),
                 "intent_notes": prompt_info.get("intent_notes", ""),
                 "settings": settings,
+                "editor_model": editor_id if mode == "edit" else None,
+                "edit_strength": edit_strength if mode == "edit" else None,
                 "refine_enabled": refine_enabled,
             })
         except Exception as exc:
+            traceback.print_exc()
             q.put({"type": "error", "message": str(exc)})
         finally:
             for path in temp_paths:

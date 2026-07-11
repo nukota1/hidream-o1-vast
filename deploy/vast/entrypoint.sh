@@ -9,8 +9,11 @@ set -euo pipefail
 : "${JANKU_R2_BUCKET:=ai-model-cache}"
 : "${JANKU_R2_KEY:=models/JANKUTrainedChenkinNoobai_v777.safetensors}"
 : "${MODEL_DOWNLOAD_ON_START:=1}"
-: "${QWEN_IMAGE_EDIT_MODEL:=Qwen/Qwen-Image-Edit-2511}"
-: "${QWEN_IMAGE_EDIT_DOWNLOAD_ON_START:=1}"
+: "${WAIFU_INPAINT_MODEL:=ShinoharaHare/Waifu-Inpaint-XL}"
+: "${WAIFU_INPAINT_DOWNLOAD_ON_START:=1}"
+: "${FLUX_KONTEXT_MODEL:=black-forest-labs/FLUX.1-Kontext-dev}"
+: "${HIDREAM_O1_IMAGE_MODEL:=HiDream-ai/HiDream-O1-Image}"
+: "${HIDREAM_O1_IMAGE_PATH:=/models/HiDream-O1-Image}"
 : "${PROMPT_REFINER_MODEL:=Qwen/Qwen3.5-9B}"
 : "${PROMPT_REFINER_DOWNLOAD_ON_START:=1}"
 
@@ -60,11 +63,11 @@ prefetch_models() {
     echo "[entrypoint] JANKU prefetch failed."
   fi
 
-  if [ "$QWEN_IMAGE_EDIT_DOWNLOAD_ON_START" = "1" ]; then
-    echo "[entrypoint] Prefetching Qwen Image Edit: $QWEN_IMAGE_EDIT_MODEL"
-    hf download "$QWEN_IMAGE_EDIT_MODEL"
+  if [ "$WAIFU_INPAINT_DOWNLOAD_ON_START" = "1" ]; then
+    echo "[entrypoint] Prefetching default editor: $WAIFU_INPAINT_MODEL"
+    hf download "$WAIFU_INPAINT_MODEL"
     if [ $? -ne 0 ]; then
-      echo "[entrypoint] Qwen Image Edit prefetch failed."
+      echo "[entrypoint] Waifu-Inpaint-XL prefetch failed. Check HF_TOKEN and model access approval."
     fi
   fi
 

@@ -5,7 +5,7 @@
 ```text
 Image: ghcr.io/nukota1/hidream-o1-image:latest
 Launch mode: Docker ENTRYPOINT
-Container disk: 120GB or more
+Container disk: 100GB or more for the default editor
 Port: 7861
 ```
 
@@ -27,8 +27,13 @@ The container does not contain model weights. At startup it begins background
 prefetch for:
 
 1. JANKU v7.77 from private R2
-2. Qwen Image Edit from Hugging Face
+2. Waifu-Inpaint-XL, the default editor, from Hugging Face
 3. Qwen3.5 prompt refiner from Hugging Face
+
+FLUX.1-Kontext-dev and HiDream-O1-Image are downloaded only after a user
+selects the corresponding editor in the web UI. Allocate additional disk before
+using them. The Hugging Face account must accept required model conditions and
+the instance must have a read token in `HF_TOKEN`.
 
 Models are stored under `/models`. Mount a persistent volume there when the Vast
 host supports it; otherwise they are downloaded for every new instance.

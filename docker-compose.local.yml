@@ -1,0 +1,25 @@
+services:
+  janku-studio:
+    build:
+      context: .
+      dockerfile: Dockerfile.ghcr
+    image: janku-image-studio:local
+    container_name: janku-image-studio-local
+    ports:
+      - "7861:7861"
+    env_file:
+      - .env
+      - .env.local
+    environment:
+      APP_HOST: 0.0.0.0
+      APP_PORT: 7861
+      HF_HOME: /models/huggingface
+    volumes:
+      - janku-models-local:/models
+    gpus: all
+    init: true
+    restart: unless-stopped
+
+volumes:
+  janku-models-local:
+    name: janku-models-local

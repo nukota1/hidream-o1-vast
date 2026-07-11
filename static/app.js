@@ -1,5 +1,6 @@
 const $ = (id) => document.getElementById(id);
 const presets = JSON.parse($("preset-data").textContent);
+const editModels = JSON.parse($("edit-model-data").textContent);
 const styleFields = [
   ["anime-strength", "anime_strength"],
   ["line-detail", "line_detail"],
@@ -57,6 +58,11 @@ function generationSettings() {
   };
 }
 
+function updateEditModelDescription() {
+  const editor = editModels[$("edit-model").value];
+  $("edit-model-description").textContent = editor ? editor.description : "";
+}
+
 function fileAsDataUrl(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -78,6 +84,7 @@ function beginProgress(message) {
 
 function finishProgress() {
   $("progress").hidden = true;
+  $("empty").hidden = true;
   $("result").hidden = false;
 }
 
@@ -130,6 +137,8 @@ function showResult(data) {
     intent_notes: data.intent_notes,
     refine_enabled: data.refine_enabled,
     generation_settings: data.settings,
+    editor_model: data.editor_model || currentMetadata.editor_model || "",
+    edit_strength: data.edit_strength ?? currentMetadata.edit_strength ?? null,
   };
   $("result-image").src = "data:image/png;base64," + data.image;
   $("optimized-prompt").textContent = data.optimized_prompt;
@@ -138,8 +147,17 @@ function showResult(data) {
 }
 
 $("preset").addEventListener("change", applyPreset);
+$("edit-model").addEventListener("change", updateEditModelDescription);
+$("edit-strength").addEventListener("input", () => {
+  $("edit-strength-value").value = $("edit-strength").value;
+});
+$("edit-mask").addEventListener("change", () => {
+  $("edit-strength").value = $("edit-mask").files.length ? 85 : 55;
+  $("edit-strength-value").value = $("edit-strength").value;
+});
 styleFields.forEach(([id]) => $(id).addEventListener("input", () => syncSlider(id)));
 applyPreset();
+updateEditModelDescription();
 
 $("generate").addEventListener("click", async () => {
   const prompt = $("prompt").value.trim();
@@ -156,6 +174,7 @@ $("generate").addEventListener("click", async () => {
   } catch (error) {
     setError(error.message);
     $("progress").hidden = true;
+    $("result").hidden = true;
     $("empty").hidden = false;
   } finally {
     button.disabled = false;
@@ -178,6 +197,8 @@ $("edit").addEventListener("click", async () => {
       prompt: instruction,
       source_image: currentImage,
       mask_image: maskImage,
+      editor_model: $("edit-model").value,
+      edit_strength: Number($("edit-strength").value) / 100,
       ...generationSettings(),
     });
     editInstructions.push(instruction);
@@ -185,6 +206,8 @@ $("edit").addEventListener("click", async () => {
     $("edit-history").insertAdjacentHTML("beforeend", "<div>AI: 修正画像を生成しました。</div>");
     $("edit-prompt").value = "";
     $("edit-mask").value = "";
+    $("edit-strength").value = 55;
+    $("edit-strength-value").value = 55;
   } catch (error) {
     setError(error.message);
     finishProgress();

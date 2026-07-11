@@ -2,7 +2,6 @@ import os
 import time
 
 import torch
-from PIL import Image
 
 
 def _torch_dtype():
@@ -205,20 +204,6 @@ def load_janku_pipeline(status_callback=None):
     )
 
 
-def load_qwen_edit_pipeline():
-    from diffusers import QwenImageEditPlusPipeline
-
-    model_ref = os.environ.get("QWEN_IMAGE_EDIT_MODEL", "Qwen/Qwen-Image-Edit-2511")
-    print(f"[qwen-edit] Loading image edit model: {model_ref}")
-    pipe = QwenImageEditPlusPipeline.from_pretrained(model_ref, torch_dtype=_torch_dtype())
-    pipe = pipe.to(_device())
-    try:
-        pipe.set_progress_bar_config(disable=None)
-    except Exception:
-        pass
-    return pipe
-
-
 def _generator(seed):
     return torch.Generator(device=_device()).manual_seed(int(seed))
 
@@ -228,6 +213,49 @@ def _set_sampler(pipe, sampler):
 
     scheduler_cls = EulerAncestralDiscreteScheduler if sampler == "euler_a" else EulerDiscreteScheduler
     pipe.scheduler = scheduler_cls.from_config(pipe.scheduler.config, timestep_spacing="linspace")
+
+
+def fit_prompt_for_sdxl(pipe, prompt):
+    """Keep comma-separated priorities inside both SDXL CLIP context windows."""
+    tokenizers = [tokenizer for tokenizer in (getattr(pipe, "tokenizer", None), getattr(pipe, "tokenizer_2", None)) if tokenizer]
+    if not tokenizers:
+        return prompt
+
+    def fits(candidate):
+        for tokenizer in tokenizers:
+            token_ids = tokenizer(candidate, truncation=False, verbose=False).input_ids
+            if len(token_ids) > tokenizer.model_max_length:
+                return False
+        return True
+
+    if fits(prompt):
+        return prompt
+
+    accepted = []
+    for part in (item.strip() for item in prompt.split(",") if item.strip()):
+        candidate = ", ".join([*accepted, part])
+        if fits(candidate):
+            accepted.append(part)
+        else:
+            break
+    compact = ", ".join(accepted)
+    if compact:
+        print("[sdxl] Prompt was compacted to fit the SDXL CLIP context window")
+        return compact
+
+    # A disabled refiner or malformed non-tag prompt may contain no commas.
+    # Token-truncate it instead of returning an overlong string unchanged.
+    compact = prompt
+    for tokenizer in tokenizers:
+        token_ids = tokenizer(
+            compact,
+            truncation=True,
+            max_length=tokenizer.model_max_length,
+            verbose=False,
+        ).input_ids
+        compact = tokenizer.decode(token_ids, skip_special_tokens=True).strip()
+    print("[sdxl] Non-tag prompt was token-truncated to fit the CLIP context window")
+    return compact
 
 
 def generate_with_janku(pipe, prompt, settings, callback=None):
@@ -251,38 +279,3 @@ def generate_with_janku(pipe, prompt, settings, callback=None):
         callback_on_step_end=on_step_end,
     ).images[0]
     return image
-
-
-def edit_with_qwen_image_edit(pipe, prompt, image_path, mask_path, seed, callback=None):
-    source = Image.open(image_path).convert("RGB")
-    images = [source]
-    edit_prompt = prompt
-    if mask_path:
-        mask = Image.open(mask_path).convert("RGB")
-        images.append(mask)
-        edit_prompt = (
-            prompt
-            + "\nUse the second image as an edit mask: white areas are editable, black areas must be preserved."
-        )
-    steps = int(os.environ.get("QWEN_IMAGE_EDIT_STEPS", "40"))
-    true_cfg_scale = float(os.environ.get("QWEN_IMAGE_EDIT_TRUE_CFG_SCALE", "4.0"))
-    guidance_scale = float(os.environ.get("QWEN_IMAGE_EDIT_GUIDANCE_SCALE", "1.0"))
-    negative_prompt = os.environ.get("QWEN_IMAGE_EDIT_NEGATIVE_PROMPT", " ")
-
-    def on_step_end(_pipe, step, _timestep, callback_kwargs):
-        if callback:
-            callback(step, steps)
-        return callback_kwargs
-
-    result = pipe(
-        image=images,
-        prompt=edit_prompt,
-        generator=torch.Generator(device=_device()).manual_seed(int(seed)),
-        true_cfg_scale=true_cfg_scale,
-        negative_prompt=negative_prompt,
-        num_inference_steps=steps,
-        guidance_scale=guidance_scale,
-        num_images_per_prompt=1,
-        callback_on_step_end=on_step_end,
-    )
-    return result.images[0]
