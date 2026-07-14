@@ -4,10 +4,16 @@ set -euo pipefail
 : "${APP_HOST:=0.0.0.0}"
 : "${APP_PORT:=7861}"
 : "${HF_HOME:=/models/huggingface}"
+: "${IMAGE_MODEL_FAMILY:=janku}"
+: "${IMAGE_MODEL_LABEL:=JANKU v7.77}"
 : "${JANKU_MODEL_PATH:=/models/checkpoints/JANKUTrainedChenkinNoobai_v777.safetensors}"
 : "${JANKU_MODEL_MIN_BYTES:=6900000000}"
 : "${JANKU_R2_BUCKET:=ai-model-cache}"
 : "${JANKU_R2_KEY:=models/JANKUTrainedChenkinNoobai_v777.safetensors}"
+: "${ANIMAGINE_MODEL_REPO:=cagliostrolab/animagine-xl-4.0}"
+: "${ANIMAGINE_MODEL_FILE:=animagine-xl-4.0-opt.safetensors}"
+: "${ANIMAGINE_MODEL_PATH:=/models/checkpoints/animagine-xl-4.0-opt.safetensors}"
+: "${ANIMAGINE_MODEL_MIN_BYTES:=6900000000}"
 : "${MODEL_DOWNLOAD_ON_START:=1}"
 : "${WAIFU_INPAINT_MODEL:=ShinoharaHare/Waifu-Inpaint-XL}"
 : "${WAIFU_INPAINT_DOWNLOAD_ON_START:=1}"
@@ -55,12 +61,44 @@ download_janku_model() {
     --min-bytes "$JANKU_MODEL_MIN_BYTES"
 }
 
+animagine_model_ready() {
+  if [ ! -f "$ANIMAGINE_MODEL_PATH" ]; then
+    return 1
+  fi
+  local actual_bytes
+  actual_bytes="$(file_size_bytes "$ANIMAGINE_MODEL_PATH")"
+  [ "$actual_bytes" -ge "$ANIMAGINE_MODEL_MIN_BYTES" ]
+}
+
+download_animagine_model() {
+  if animagine_model_ready; then
+    echo "[entrypoint] Animagine model already present: $ANIMAGINE_MODEL_PATH"
+    return 0
+  fi
+  echo "[entrypoint] Downloading Animagine XL 4.0 Opt from Hugging Face"
+  mkdir -p "$(dirname "$ANIMAGINE_MODEL_PATH")"
+  hf download "$ANIMAGINE_MODEL_REPO" "$ANIMAGINE_MODEL_FILE" \
+    --local-dir "$(dirname "$ANIMAGINE_MODEL_PATH")"
+  if ! animagine_model_ready; then
+    echo "[entrypoint] Animagine download did not produce a complete model file."
+    return 1
+  fi
+}
+
+download_image_model() {
+  if [ "$IMAGE_MODEL_FAMILY" = "animagine" ]; then
+    download_animagine_model
+  else
+    download_janku_model
+  fi
+}
+
 prefetch_models() {
   set +e
   echo "[entrypoint] Background model prefetch started."
-  download_janku_model
+  download_image_model
   if [ $? -ne 0 ]; then
-    echo "[entrypoint] JANKU prefetch failed."
+    echo "[entrypoint] Image-model prefetch failed."
   fi
 
   if [ "$WAIFU_INPAINT_DOWNLOAD_ON_START" = "1" ]; then
@@ -81,9 +119,14 @@ prefetch_models() {
   echo "[entrypoint] Background model prefetch finished."
 }
 
-echo "[entrypoint] App: JANKU Image Studio"
-echo "[entrypoint] JANKU cache: s3://$JANKU_R2_BUCKET/$JANKU_R2_KEY"
-echo "[entrypoint] JANKU path: $JANKU_MODEL_PATH"
+echo "[entrypoint] App: ${APP_NAME:-JANKU Image Studio}"
+echo "[entrypoint] Image model: $IMAGE_MODEL_LABEL ($IMAGE_MODEL_FAMILY)"
+if [ "$IMAGE_MODEL_FAMILY" = "animagine" ]; then
+  echo "[entrypoint] Animagine path: $ANIMAGINE_MODEL_PATH"
+else
+  echo "[entrypoint] JANKU cache: s3://$JANKU_R2_BUCKET/$JANKU_R2_KEY"
+  echo "[entrypoint] JANKU path: $JANKU_MODEL_PATH"
+fi
 
 if [ "$MODEL_DOWNLOAD_ON_START" = "1" ]; then
   prefetch_models &

@@ -37,9 +37,56 @@ _STATE = {
     "refiner": LocalPromptRefiner(),
 }
 
+IMAGE_MODEL_FAMILY = os.environ.get("IMAGE_MODEL_FAMILY", "janku").strip().lower()
+IMAGE_MODEL_LABEL = os.environ.get(
+    "IMAGE_MODEL_LABEL",
+    "Animagine XL 4.0 Opt" if IMAGE_MODEL_FAMILY == "animagine" else "JANKU v7.77",
+)
+APP_NAME = os.environ.get("APP_NAME", "Animagine Image Studio" if IMAGE_MODEL_FAMILY == "animagine" else "JANKU Image Studio")
+
 BASE_NEGATIVE_PROMPT = (
     "lowres, worst quality, low quality, bad anatomy, bad hands, extra fingers, "
     "missing fingers, malformed limbs, blurry, jpeg artifacts, text, watermark, signature"
+)
+
+BACKGROUNDLESS_POSITIVE_TAGS = ("simple white background", "plain background", "isolated")
+BACKGROUNDLESS_NEGATIVE_TAGS = (
+    "scenery",
+    "detailed background",
+    "landscape",
+    "outdoors",
+    "indoors",
+    "room",
+    "street",
+    "city",
+    "forest",
+    "sky",
+    "clouds",
+    "building",
+    "furniture",
+    "horizon",
+    "road",
+    "school",
+    "beach",
+    "mountain",
+    "river",
+    "garden",
+    "field",
+    "alley",
+    "rain",
+    "snow",
+    "puddle",
+    "sunset",
+    "sunrise",
+)
+BACKGROUNDLESS_JAPANESE_PATTERNS = (
+    r"背景\s*(?:を|は)?\s*(?:描かない|描くな|描かなくて|不要|いらない|なし|無し|省略)",
+    r"(?:背景なし|背景無し|無背景|背景不要|背景は不要|背景はいらない)",
+    r"(?:白背景|白い背景|単色背景|無地背景)",
+)
+BACKGROUNDLESS_ENGLISH_PATTERN = re.compile(
+    r"\b(?:no|without)\s+(?:a\s+)?background\b|\bbackgroundless\b|\bwhite background\b|\bplain background\b",
+    re.IGNORECASE,
 )
 
 STYLE_PRESETS = {
@@ -131,6 +178,65 @@ STYLE_PRESETS = {
         "style": {"anime_strength": 70, "line_detail": 70, "color_vividness": 65, "background_mood": 60, "photoreal_avoidance": 80},
     },
 }
+
+
+if IMAGE_MODEL_FAMILY == "animagine":
+    animagine_negative = (
+        "lowres, bad anatomy, bad hands, text, error, missing finger, extra digits, "
+        "fewer digits, cropped, worst quality, low quality, low score, bad score, "
+        "average score, signature, watermark, username, blurry"
+    )
+    STYLE_PRESETS["bishoujo_game"].update({
+        "prompt_hint": (
+            "luminous high-end Japanese bishoujo game CG, detailed anime illustration, "
+            "soft layered shading, transparent color rendering, refined character art"
+        ),
+        "positive_style_tags": [
+            "high-end Japanese bishoujo game CG",
+            "visual novel CG",
+            "detailed anime illustration",
+            "anime coloring",
+            "highly detailed",
+            "intricate details",
+            "detailed glossy eyes",
+            "soft layered shading",
+            "transparent color rendering",
+            "luminous soft lighting",
+            "delicate highlights",
+            "rich vivid colors",
+        ],
+        "negative_style_tags": [
+            "flat color",
+            "flat shading",
+            "muted colors",
+            "dull colors",
+            "underexposed",
+            "crushed blacks",
+        ],
+        "width": 1024,
+        "height": 1024,
+        "steps": 28,
+        "cfg": 5.0,
+        "sampler": "euler_a",
+        "clip_skip": 2,
+        "negative_prompt": animagine_negative,
+        "style": {"anime_strength": 100, "line_detail": 100, "color_vividness": 91, "background_mood": 0, "photoreal_avoidance": 85},
+    })
+    STYLE_PRESETS["anime_illustration"].update({
+        "width": 1024, "height": 1024,
+        "steps": 28, "cfg": 5.0, "sampler": "euler_a", "negative_prompt": animagine_negative,
+    })
+    STYLE_PRESETS["manga"].update({
+        "width": 1024, "height": 1024,
+        "steps": 28, "cfg": 5.0, "sampler": "euler_a", "negative_prompt": animagine_negative + ", full color",
+    })
+    STYLE_PRESETS["light_novel"].update({
+        "width": 1024, "height": 1024,
+        "steps": 28, "cfg": 5.0, "sampler": "euler_a", "negative_prompt": animagine_negative,
+    })
+    STYLE_PRESETS["custom"].update({
+        "steps": 28, "cfg": 5.0, "sampler": "euler_a", "negative_prompt": animagine_negative,
+    })
 
 
 def clamp_int(value, default, low, high):
@@ -269,6 +375,91 @@ def style_adjustment_tags(style, preset_style):
     return tags
 
 
+def join_unique_tags(*groups):
+    tags = []
+    seen = set()
+    for group in groups:
+        for item in group:
+            tag = str(item).strip()
+            if tag and tag.lower() not in seen:
+                tags.append(tag)
+                seen.add(tag.lower())
+    return ", ".join(tags)
+
+
+def background_suppression_requested(user_prompt, mode):
+    """Treat an explicit no-background request as composition, not style."""
+    if mode != "t2i":
+        return False
+    return (
+        any(re.search(pattern, user_prompt) for pattern in BACKGROUNDLESS_JAPANESE_PATTERNS)
+        or bool(BACKGROUNDLESS_ENGLISH_PATTERN.search(user_prompt))
+    )
+
+
+def _is_background_scene_tag(tag):
+    value = tag.lower().strip()
+    scene_terms = (
+        "background",
+        "scenery",
+        "landscape",
+        "outdoors",
+        "indoors",
+        "room",
+        "street",
+        "city",
+        "forest",
+        "sky",
+        "cloud",
+        "building",
+        "furniture",
+        "horizon",
+        "road",
+        "school",
+        "beach",
+        "mountain",
+        "river",
+        "garden",
+        "field",
+        "alley",
+        "rain",
+        "snow",
+        "puddle",
+        "sunset",
+        "sunrise",
+        "schoolyard",
+        "school yard",
+        "classroom",
+    )
+    return any(term in value for term in scene_terms)
+
+
+def apply_background_suppression(prompt_info, settings):
+    """Make an explicit background ban survive both prompt refinement and SDXL priors."""
+    quality_tags = ["masterpiece", "high score", "great score", "absurdres"]
+    tags = [tag.strip() for tag in prompt_info["prompt"].split(",") if tag.strip()]
+    quality = [tag for tag in tags if tag.lower() in {item.lower() for item in quality_tags}]
+    subject_tags = [
+        tag for tag in tags
+        if tag.lower() not in {item.lower() for item in quality_tags}
+        and not _is_background_scene_tag(tag)
+    ]
+    prompt_info["prompt"] = join_unique_tags(
+        subject_tags,
+        BACKGROUNDLESS_POSITIVE_TAGS,
+        quality if quality else (quality_tags if IMAGE_MODEL_FAMILY == "animagine" else ()),
+    )
+    settings["negative_prompt"] = join_unique_tags(
+        settings["negative_prompt"].split(","),
+        BACKGROUNDLESS_NEGATIVE_TAGS,
+    )
+    prompt_info["intent_notes"] = (
+        f"{prompt_info.get('intent_notes', '')} Background suppression applied: "
+        "isolated subject on a simple white background."
+    ).strip()
+    return prompt_info
+
+
 def style_negative_prompt(negative_prompt, style, preset_style, preset_negative_tags=()):
     """Make each style control affect diffusion conditioning, not just the refiner."""
     additions = list(preset_negative_tags)
@@ -299,7 +490,7 @@ def style_negative_prompt(negative_prompt, style, preset_style, preset_negative_
 
 def apply_image_style_tone(image, settings):
     """Apply the selected presentation controls after diffusion has finished."""
-    if settings["preset"] != "bishoujo_game":
+    if IMAGE_MODEL_FAMILY != "janku" or settings["preset"] != "bishoujo_game":
         return image
 
     style = settings["style"]
@@ -332,9 +523,25 @@ def prepare_prompt(user_prompt, mode, settings, refine_enabled):
                 enhance=refine_enabled,
             )
             if preset_style_tags or adjustment_tags:
-                # Keep the selected render direction and explicit adjustments
-                # ahead of the compacted request so SDXL actually receives them.
-                refined["prompt"] = ", ".join([*preset_style_tags, *adjustment_tags, refined["prompt"]])
+                # Animagine follows ordered tags. User-requested composition and
+                # setting must precede preset styling; quality stays last.
+                if IMAGE_MODEL_FAMILY == "animagine":
+                    # Animagine requires its quality tags to remain at the end.
+                    quality = ["masterpiece", "high score", "great score", "absurdres"]
+                    tags = [tag.strip() for tag in refined["prompt"].split(",") if tag.strip()]
+                    tags = [tag for tag in tags if tag.lower() not in {item.lower() for item in quality}]
+                    refined["prompt"] = join_unique_tags(
+                        tags,
+                        adjustment_tags,
+                        preset_style_tags,
+                        quality,
+                    )
+                else:
+                    refined["prompt"] = join_unique_tags(
+                        preset_style_tags,
+                        adjustment_tags,
+                        refined["prompt"].split(","),
+                    )
                 refined["intent_notes"] = (
                     f"{refined.get('intent_notes', '')} Applied style controls: "
                     f"{', '.join([*preset_style_tags, *adjustment_tags])}."
@@ -449,6 +656,8 @@ def index():
     refine_default = os.environ.get("PROMPT_REFINE_DEFAULT", "1").lower() not in {"0", "false", "no", "off"}
     return render_template(
         "index.html",
+        app_name=APP_NAME,
+        image_model_label=IMAGE_MODEL_LABEL,
         presets=STYLE_PRESETS,
         presets_json=json.dumps(STYLE_PRESETS, ensure_ascii=False),
         editor_models=editor_model_choices(),
@@ -498,6 +707,8 @@ def api_generate_start():
         try:
             q.put({"type": "status", "phase": "refine", "message": "プロンプトを準備しています"})
             prompt_info = prepare_prompt(prompt, mode, settings, refine_enabled)
+            if background_suppression_requested(prompt, mode):
+                prompt_info = apply_background_suppression(prompt_info, settings)
             _STATE["refiner"].unload_if_cuda()
             q.put({
                 "type": "optimized_prompt",
@@ -543,7 +754,7 @@ def api_generate_start():
                         status_callback=lambda message: q.put({"type": "status", "phase": "generate", "message": message}),
                     )
                 else:
-                    q.put({"type": "status", "phase": "generate", "message": "JANKU v7.77を準備しています"})
+                    q.put({"type": "status", "phase": "generate", "message": f"{IMAGE_MODEL_LABEL}を準備しています"})
                     unload_active_editor()
                     if _STATE["janku_pipe"] is None:
                         def model_status(message):
@@ -620,13 +831,13 @@ def api_generate_stream(job_id):
 
 
 def main():
-    parser = argparse.ArgumentParser("JANKU Image Studio")
+    parser = argparse.ArgumentParser(APP_NAME)
     parser.add_argument("--host", default=os.environ.get("APP_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("APP_PORT", "7861")))
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU is required for image generation.")
-    print(f"[app] Serving JANKU Image Studio on http://{args.host}:{args.port}")
+    print(f"[app] Serving {APP_NAME} ({IMAGE_MODEL_LABEL}) on http://{args.host}:{args.port}")
     app.run(host=args.host, port=args.port, debug=False, threaded=True)
 
 

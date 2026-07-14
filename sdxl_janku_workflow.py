@@ -23,6 +23,24 @@ def _device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def _image_model_family():
+    return os.environ.get("IMAGE_MODEL_FAMILY", "janku").strip().lower()
+
+
+def _animagine_model_path():
+    return os.environ.get(
+        "ANIMAGINE_MODEL_PATH",
+        "/models/checkpoints/animagine-xl-4.0-opt.safetensors",
+    )
+
+
+def _animagine_min_bytes():
+    try:
+        return int(os.environ.get("ANIMAGINE_MODEL_MIN_BYTES", "6900000000"))
+    except ValueError:
+        return 6900000000
+
+
 def _min_janku_bytes():
     try:
         return int(os.environ.get("JANKU_MODEL_MIN_BYTES", "6900000000"))
@@ -164,13 +182,35 @@ def _download_if_needed(path, status_callback=None):
         raise
 
 
-def _load_single_file_or_repo(pipeline_cls, model_ref, dtype, single_file_pipeline_cls=None):
+def _wait_for_model_file(path, min_bytes, status_callback=None):
+    """Wait for the entrypoint's background Hugging Face download."""
+    wait_seconds = int(os.environ.get("MODEL_DOWNLOAD_WAIT_SECONDS", "7200"))
+    waited = 0
+    while not _is_complete_file(path, min_bytes):
+        if waited >= wait_seconds:
+            raise RuntimeError(f"Timed out waiting for model download: {path}")
+        if status_callback and waited % 10 == 0:
+            actual = os.path.getsize(path) if os.path.isfile(path) else 0
+            status_callback(
+                f"Waiting for image model download: {_format_bytes(actual)} / at least {_format_bytes(min_bytes)}"
+            )
+        time.sleep(5)
+        waited += 5
+
+
+def _load_single_file_or_repo(
+    pipeline_cls,
+    model_ref,
+    dtype,
+    single_file_pipeline_cls=None,
+    single_file_kwargs=None,
+):
     if not model_ref:
         raise RuntimeError("Model path/repo is not configured.")
     kwargs = {"torch_dtype": dtype, "use_safetensors": True}
     if os.path.isfile(model_ref):
         cls = single_file_pipeline_cls or pipeline_cls
-        pipe = cls.from_single_file(model_ref, **kwargs)
+        pipe = cls.from_single_file(model_ref, **kwargs, **(single_file_kwargs or {}))
     elif model_ref.endswith((".safetensors", ".ckpt")):
         raise RuntimeError(f"Model file does not exist: {model_ref}")
     else:
@@ -189,6 +229,24 @@ def _load_single_file_or_repo(pipeline_cls, model_ref, dtype, single_file_pipeli
 
 def load_janku_pipeline(status_callback=None):
     from diffusers import AutoPipelineForText2Image, StableDiffusionXLPipeline
+
+    if _image_model_family() == "animagine":
+        model_path = _animagine_model_path()
+        _wait_for_model_file(model_path, _animagine_min_bytes(), status_callback=status_callback)
+        print(f"[sdxl] Loading Animagine XL 4.0 Opt model: {model_path}")
+        if status_callback:
+            status_callback("Loading Animagine XL 4.0 Opt into GPU memory")
+        return _load_single_file_or_repo(
+            AutoPipelineForText2Image,
+            model_path,
+            _torch_dtype(),
+            single_file_pipeline_cls=StableDiffusionXLPipeline,
+            single_file_kwargs={
+                "config": "cagliostrolab/animagine-xl-4.0",
+                "custom_pipeline": "lpw_stable_diffusion_xl",
+                "add_watermarker": False,
+            },
+        )
 
     model_path = os.environ.get("JANKU_MODEL_PATH", "")
     _download_if_needed(model_path, status_callback=status_callback)
@@ -217,6 +275,9 @@ def _set_sampler(pipe, sampler):
 
 def fit_prompt_for_sdxl(pipe, prompt):
     """Keep comma-separated priorities inside both SDXL CLIP context windows."""
+    # Animagine's official LPW pipeline accepts the longer ordered tag prompt.
+    if _image_model_family() == "animagine":
+        return prompt
     tokenizers = [tokenizer for tokenizer in (getattr(pipe, "tokenizer", None), getattr(pipe, "tokenizer_2", None)) if tokenizer]
     if not tokenizers:
         return prompt

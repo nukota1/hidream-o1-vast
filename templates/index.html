@@ -3,13 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>JANKU Image Studio</title>
+  <title>{{ app_name }}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">JANKU Image Studio</div>
-    <div class="model-name">JANKU v7.77</div>
+    <div class="brand">{{ app_name }}</div>
+    <div class="model-name">{{ image_model_label }}</div>
   </header>
 
   <div class="workspace">

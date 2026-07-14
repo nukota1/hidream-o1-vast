@@ -74,6 +74,51 @@ is explicitly present. Return JSON only with keys "prompt" and "intent_notes".
 Use at most 16 short comma-separated tags.
 """.strip()
 
+ANIMAGINE_SYSTEM_PROMPT = """
+You are a prompt director for Animagine XL 4.0 Opt, an SDXL anime model trained
+on ordered Danbooru-style tags. Convert the user's Japanese request into one
+concise English image prompt.
+
+Rules:
+- Preserve every requested subject, appearance detail, outfit, pose, camera
+  angle, composition, weather, background, color, material, expression, and mood.
+- Never invent unrelated characters, props, text, logos, brands, or locations.
+- Return canonical short Danbooru tags only, never prose sentences.
+- Order the tags as: 1girl/1boy and identity, rating, composition and subject
+  details, clothing and props, setting and weather, then quality tags.
+- Use concrete tags such as `1girl`, `solo`, `full body`, `blonde hair`,
+  `red eyes`, `long dress`, `transparent umbrella`, `rain`, and `rural road`.
+- Use `safe` for ordinary non-explicit requests.
+- Keep the requested facts compact enough for SDXL. Do not replace requested
+  facts with generic style words.
+- Never omit a requested camera angle, pose, composition, foreground/background
+  relationship, or setting. These are primary image facts, not optional detail.
+- You may use up to 48 short tags. Keep the requested tag order intact: subject
+  and composition first, then appearance/clothing/props, then setting/weather.
+- If the user explicitly requests no background, a blank background, or a white
+  background, use `simple white background, plain background, isolated` and do
+  not add scenery, rooms, landscapes, sky, buildings, or other setting tags.
+- End text-to-image prompts with exactly: `masterpiece, high score, great score, absurdres`.
+- Japanese clothing glossary: `ワンピース` and `ロングワンピース` mean `dress`
+  and `long dress`, never `swimsuit` unless the user explicitly says `水着`.
+- For edits, preserve the source character identity, face, hairstyle, body
+  proportions, pose, framing, and composition unless explicitly changed.
+- Return JSON only with keys "prompt" and "intent_notes".
+""".strip()
+
+ANIMAGINE_RETRY_SYSTEM_PROMPT = """
+Convert the request into one compact ordered Animagine XL 4.0 Opt prompt.
+Reply with one comma-separated line of canonical Danbooru tags only: no JSON,
+no explanation, no markdown, and no prose. Start with the subject and requested
+scene facts. Do not omit requested camera angle, pose, composition, setting, or
+weather. You may use up to 48 short tags. End with: masterpiece, high score,
+great score, absurdres.
+""".strip()
+
+
+def _is_animagine():
+    return os.environ.get("IMAGE_MODEL_FAMILY", "janku").strip().lower() == "animagine"
+
 
 class LocalPromptRefiner:
     def __init__(self, model_id=None):
@@ -193,6 +238,47 @@ class LocalPromptRefiner:
         return ", ".join(accepted)
 
     @staticmethod
+    def _compact_animagine_prompt(prompt):
+        """Animagine's LPW pipeline can retain a detailed ordered tag sequence."""
+        tags = []
+        seen = set()
+        for tag in (item.strip() for item in re.split(r"[,\n]", prompt) if item.strip()):
+            key = tag.lower()
+            if key in seen:
+                continue
+            candidate = ", ".join([*tags, tag])
+            if len(tags) >= 48 or len(candidate) > 900:
+                break
+            tags.append(tag)
+            seen.add(key)
+        return ", ".join(tags)
+
+    @staticmethod
+    def _compact_for_active_model(prompt):
+        if _is_animagine():
+            return LocalPromptRefiner._compact_animagine_prompt(prompt)
+        return LocalPromptRefiner._compact_prompt(prompt)
+
+    @staticmethod
+    def _with_animagine_quality_tags(prompt):
+        quality_tags = ["masterpiece", "high score", "great score", "absurdres"]
+        tags = [
+            tag.strip()
+            for tag in prompt.split(",")
+            if tag.strip() and tag.strip().lower() not in {item.lower() for item in quality_tags}
+        ]
+        suffix = ", ".join(quality_tags)
+        while tags and len(", ".join([*tags, suffix])) > 900:
+            tags.pop()
+        return ", ".join([*tags, suffix])
+
+    @staticmethod
+    def _finalize_prompt(result, mode):
+        if _is_animagine() and mode == "t2i":
+            result["prompt"] = LocalPromptRefiner._with_animagine_quality_tags(result["prompt"])
+        return result
+
+    @staticmethod
     def _parse_json(text):
         text = text.strip()
         if "<think>" in text and "</think>" in text:
@@ -210,7 +296,7 @@ class LocalPromptRefiner:
         if start < 0 or end <= start:
             raise ValueError("Prompt refiner did not return JSON.")
         result = json.loads(text[start:end + 1])
-        prompt = LocalPromptRefiner._compact_prompt(str(result.get("prompt", "")).strip())
+        prompt = LocalPromptRefiner._compact_for_active_model(str(result.get("prompt", "")).strip())
         if len(prompt) < 20:
             raise ValueError("Prompt refiner returned an empty or very short prompt.")
         return {
@@ -225,7 +311,7 @@ class LocalPromptRefiner:
             text = text.split("</think>", 1)[1].strip()
         text = re.sub(r"^\s*(?:prompt|final prompt)\s*[:：]\s*", "", text, flags=re.IGNORECASE)
         text = text.replace("```", "").strip()
-        prompt = LocalPromptRefiner._compact_prompt(text)
+        prompt = LocalPromptRefiner._compact_for_active_model(text)
         if len(prompt) < 20:
             raise ValueError("Prompt refiner retry returned an empty or very short prompt.")
         # A retry must be an English SDXL prompt. Do not silently send another
@@ -257,7 +343,7 @@ class LocalPromptRefiner:
                 continue
             if tag.lower() not in {item.lower() for item in tags}:
                 tags.append(tag)
-        result["prompt"] = LocalPromptRefiner._compact_prompt(", ".join(tags))
+        result["prompt"] = LocalPromptRefiner._compact_for_active_model(", ".join(tags))
         return result
 
     def _generate(self, messages, max_new_tokens):
@@ -290,6 +376,8 @@ class LocalPromptRefiner:
         self._load()
         if mode == "edit":
             system_prompt = EDIT_SYSTEM_PROMPT
+        elif _is_animagine():
+            system_prompt = ANIMAGINE_SYSTEM_PROMPT
         elif enhance:
             system_prompt = SYSTEM_PROMPT
         else:
@@ -312,11 +400,12 @@ class LocalPromptRefiner:
         try:
             result = self._parse_json(raw)
             result["source"] = self.model_id
-            return self._apply_japanese_glossary(result, user_prompt, mode)
+            result = self._apply_japanese_glossary(result, user_prompt, mode)
+            return self._finalize_prompt(result, mode)
         except (ValueError, json.JSONDecodeError) as exc:
             print(f"[refine] JSON response was unusable ({exc}); retrying with plain-text output")
 
-        retry_system = RETRY_SYSTEM_PROMPT
+        retry_system = ANIMAGINE_RETRY_SYSTEM_PROMPT if _is_animagine() and mode == "t2i" else RETRY_SYSTEM_PROMPT
         if mode == "edit":
             retry_system = EDIT_SYSTEM_PROMPT.replace("Return JSON only with keys \"prompt\" and \"intent_notes\".", "Reply with one comma-separated line only.")
         elif not enhance:
@@ -335,4 +424,5 @@ class LocalPromptRefiner:
         result = self._parse_plain_prompt(self._generate(retry_messages, max_new_tokens))
         suffix = "plain-retry" if enhance else "translation-only-retry"
         result["source"] = f"{self.model_id}:{suffix}"
-        return self._apply_japanese_glossary(result, user_prompt, mode)
+        result = self._apply_japanese_glossary(result, user_prompt, mode)
+        return self._finalize_prompt(result, mode)

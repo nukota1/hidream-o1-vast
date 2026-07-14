@@ -5,7 +5,8 @@ for development and on a rented GPU server for production.
 
 ## Runtime
 
-- Text-to-image: JANKU v7.77 / Illustrious XL
+- Local text-to-image: Animagine XL 4.0 Opt / SDXL
+- Vast.ai text-to-image: JANKU v7.77 / Illustrious XL (unchanged for now)
 - Default image editing: ShinoharaHare/Waifu-Inpaint-XL
 - Optional image editing: FLUX.1-Kontext-dev and HiDream-O1-Image, loaded only when selected
 - Prompt refinement: Qwen/Qwen3.5-9B on CPU, optional per request
@@ -26,7 +27,7 @@ volume `janku-models-local`. Recreating the container does not download models
 again.
 
 Waifu-Inpaint-XL is the default editor and fits alongside this application's
-single-active-model design on a 32GB GPU. JANKU is unloaded before an edit model
+single-active-model design on a 32GB GPU. The active text model is unloaded before an edit model
 loads, and the editor is unloaded before the next JANKU generation. Reserve at
 least 80GB of Docker disk for JANKU, Waifu-Inpaint-XL, and the prompt refiner.
 FLUX.1-Kontext-dev and HiDream-O1-Image are intentionally not downloaded until
@@ -42,8 +43,8 @@ they are chosen in the web UI; reserve substantially more disk when using either
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\local.ps1 start
 ```
 
-The first startup downloads JANKU from R2, Waifu-Inpaint-XL, and Qwen3.5 from
-Hugging Face. It starts the web app immediately while these models are
+The first local startup downloads Animagine XL 4.0 Opt, Waifu-Inpaint-XL, and
+Qwen3.5-9B from Hugging Face. It starts the web app immediately while these models are
 cached in the background. Check readiness and download progress with:
 
 ```powershell
@@ -52,17 +53,20 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\local.ps1 logs
 
 Other commands are `stop`, `restart`, `status`, and `build`.
 
-## JANKU defaults
+## Local Animagine defaults
 
-The v7.77 model guidance recommends Euler or Euler A, 25-30 steps, CFG 3-5,
-and Clip Skip 2. The application default is:
+Animagine XL 4.0 Opt uses ordered Danbooru tags. The local application uses the
+officially recommended settings:
 
 ```text
-Sampler: Euler
-Steps: 32
+Sampler: Euler A
+Steps: 28
 CFG: 5.0
 Clip Skip: 2
 ```
+
+The local Qwen3.5-9B refiner translates Japanese into Animagine-compatible
+ordered tags and appends `masterpiece, high score, great score, absurdres`.
 
 The web UI provides presets for bishoujo visual-novel CG, anime illustration,
 manga, light-novel illustration, and custom settings. Every value can be changed
