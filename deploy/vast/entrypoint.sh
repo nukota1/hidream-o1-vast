@@ -5,7 +5,13 @@ set -euo pipefail
 : "${APP_PORT:=7861}"
 : "${HF_HOME:=/models/huggingface}"
 : "${IMAGE_MODEL_FAMILY:=janku}"
-: "${IMAGE_MODEL_LABEL:=JANKU v7.77}"
+if [ "$IMAGE_MODEL_FAMILY" = "animagine" ]; then
+  : "${APP_NAME:=Animagine Image Studio}"
+  : "${IMAGE_MODEL_LABEL:=Animagine XL 4.0 Opt}"
+else
+  : "${APP_NAME:=JANKU Image Studio}"
+  : "${IMAGE_MODEL_LABEL:=JANKU v7.77}"
+fi
 : "${JANKU_MODEL_PATH:=/models/checkpoints/JANKUTrainedChenkinNoobai_v777.safetensors}"
 : "${JANKU_MODEL_MIN_BYTES:=6900000000}"
 : "${JANKU_R2_BUCKET:=ai-model-cache}"
@@ -119,7 +125,7 @@ prefetch_models() {
   echo "[entrypoint] Background model prefetch finished."
 }
 
-echo "[entrypoint] App: ${APP_NAME:-JANKU Image Studio}"
+echo "[entrypoint] App: $APP_NAME"
 echo "[entrypoint] Image model: $IMAGE_MODEL_LABEL ($IMAGE_MODEL_FAMILY)"
 if [ "$IMAGE_MODEL_FAMILY" = "animagine" ]; then
   echo "[entrypoint] Animagine path: $ANIMAGINE_MODEL_PATH"
