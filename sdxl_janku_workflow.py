@@ -7,8 +7,14 @@ import torch
 def _torch_dtype():
     dtype_name = os.environ.get("MODEL_TORCH_DTYPE", "auto").lower()
     if dtype_name == "auto":
-        device_name = torch.cuda.get_device_name(0).lower() if torch.cuda.is_available() else ""
-        dtype_name = "float16" if "v100" in device_name or "tesla v100" in device_name else "bfloat16"
+        # Animagine's official single-file LPW example uses FP16. In practice
+        # it also avoids VAE colour corruption seen with automatic BF16 on
+        # recent consumer GPUs.
+        if _image_model_family() == "animagine":
+            dtype_name = "float16"
+        else:
+            device_name = torch.cuda.get_device_name(0).lower() if torch.cuda.is_available() else ""
+            dtype_name = "float16" if "v100" in device_name or "tesla v100" in device_name else "bfloat16"
     return {
         "bf16": torch.bfloat16,
         "bfloat16": torch.bfloat16,
@@ -275,9 +281,6 @@ def _set_sampler(pipe, sampler):
 
 def fit_prompt_for_sdxl(pipe, prompt):
     """Keep comma-separated priorities inside both SDXL CLIP context windows."""
-    # Animagine's official LPW pipeline accepts the longer ordered tag prompt.
-    if _image_model_family() == "animagine":
-        return prompt
     tokenizers = [tokenizer for tokenizer in (getattr(pipe, "tokenizer", None), getattr(pipe, "tokenizer_2", None)) if tokenizer]
     if not tokenizers:
         return prompt
@@ -289,17 +292,20 @@ def fit_prompt_for_sdxl(pipe, prompt):
                 return False
         return True
 
-    if fits(prompt):
-        return prompt
+    quality_tags = ("masterpiece", "high score", "great score", "absurdres")
+    parts = [item.strip() for item in prompt.split(",") if item.strip()]
+    quality = [part for part in parts if part.lower() in quality_tags]
+    content = [part for part in parts if part.lower() not in quality_tags]
+    quality_suffix = ", ".join(quality)
 
     accepted = []
-    for part in (item.strip() for item in prompt.split(",") if item.strip()):
-        candidate = ", ".join([*accepted, part])
+    for part in content:
+        candidate = ", ".join([*accepted, part, quality_suffix]).strip(", ")
         if fits(candidate):
             accepted.append(part)
         else:
-            break
-    compact = ", ".join(accepted)
+            continue
+    compact = ", ".join([*accepted, *quality])
     if compact:
         print("[sdxl] Prompt was compacted to fit the SDXL CLIP context window")
         return compact

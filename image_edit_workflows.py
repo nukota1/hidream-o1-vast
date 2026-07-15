@@ -3,10 +3,12 @@ import os
 import subprocess
 import sys
 import tempfile
+from collections import deque
 from pathlib import Path
 
+import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 
 from sdxl_janku_workflow import fit_prompt_for_sdxl
 
@@ -45,7 +47,9 @@ def _device():
 
 
 def _dtype():
-    return torch.bfloat16 if _device() == "cuda" else torch.float32
+    # Waifu-Inpaint-XL is an SDXL checkpoint, and its published FP16 weights
+    # are more reliable than automatic BF16 on recent consumer GPUs.
+    return torch.float16 if _device() == "cuda" else torch.float32
 
 
 def _generator(seed):
@@ -108,17 +112,84 @@ def load_editor_pipeline(editor_id, status_callback=None):
     raise RuntimeError(f"Unsupported image editor: {editor_id}")
 
 
-def _load_source_and_mask(image_path, mask_path):
+def _automatic_background_mask(source):
+    """Return a flood-filled mask for a near-uniform background, if present."""
+    pixels = np.asarray(source, dtype=np.int16)
+    height, width, _ = pixels.shape
+    edge_pixels = np.concatenate((
+        pixels[0:2].reshape(-1, 3),
+        pixels[max(0, height - 2):height].reshape(-1, 3),
+        pixels[:, 0:2].reshape(-1, 3),
+        pixels[:, max(0, width - 2):width].reshape(-1, 3),
+    ))
+    background_colour = np.median(edge_pixels, axis=0)
+    # The flood-fill prevents light clothing within the silhouette from being
+    # selected as background merely because it is close to white.
+    candidates = np.max(np.abs(pixels - background_colour), axis=2) <= 34
+    background = np.zeros((height, width), dtype=bool)
+    pending = deque()
+
+    for x in range(width):
+        for y in (0, height - 1):
+            if candidates[y, x] and not background[y, x]:
+                background[y, x] = True
+                pending.append((y, x))
+    for y in range(1, height - 1):
+        for x in (0, width - 1):
+            if candidates[y, x] and not background[y, x]:
+                background[y, x] = True
+                pending.append((y, x))
+
+    while pending:
+        y, x = pending.popleft()
+        for next_y, next_x in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if (
+                0 <= next_y < height
+                and 0 <= next_x < width
+                and candidates[next_y, next_x]
+                and not background[next_y, next_x]
+            ):
+                background[next_y, next_x] = True
+                pending.append((next_y, next_x))
+
+    if background.mean() < 0.12:
+        return None
+    return Image.fromarray((background * 255).astype(np.uint8), mode="L")
+
+
+def extract_plain_background_mask(image_path):
+    """Load a source image and return its reusable plain-background mask."""
+    source = Image.open(image_path).convert("RGB")
+    return source, _automatic_background_mask(source)
+
+
+def normalize_plain_background(image):
+    """Replace only edge-connected plain background pixels with pure white."""
+    source = image.convert("RGB")
+    background_mask = _automatic_background_mask(source)
+    if background_mask is None:
+        return source
+    result = Image.new("RGB", source.size, color="white")
+    result.paste(source, (0, 0), ImageOps.invert(background_mask))
+    return result
+
+
+def _load_source_and_mask(image_path, mask_path, edit_scope, status_callback=None):
     source = Image.open(image_path).convert("RGB")
     if mask_path:
         mask = Image.open(mask_path).convert("L").resize(source.size)
-        has_explicit_mask = True
-    else:
-        # A full mask is necessary for instruction-only editing. It is paired
-        # with a low denoising strength below to retain the original character.
-        mask = Image.new("L", source.size, color=255)
-        has_explicit_mask = False
-    return source, mask, has_explicit_mask
+        return source, mask, True
+    if edit_scope == "background":
+        mask = _automatic_background_mask(source)
+        if mask is not None:
+            if status_callback:
+                status_callback("立ち絵の無地背景を抽出しています")
+            return source, mask, True
+    # Pose changes and arbitrary source images need full-image editing. It is
+    # paired with a low denoising strength to retain the source when possible.
+    if status_callback:
+        status_callback("画像全体を編集対象として準備しています")
+    return source, Image.new("L", source.size, color=255), False
 
 
 def _step_callback(callback, total):
@@ -130,13 +201,18 @@ def _step_callback(callback, total):
     return on_step_end
 
 
-def _edit_waifu(pipe, prompt, image_path, mask_path, seed, strength, callback):
-    source, mask, has_explicit_mask = _load_source_and_mask(image_path, mask_path)
+def _edit_waifu(pipe, prompt, image_path, mask_path, seed, strength, callback, edit_scope, status_callback):
+    source, mask, has_edit_mask = _load_source_and_mask(
+        image_path,
+        mask_path,
+        edit_scope,
+        status_callback=status_callback,
+    )
     steps = int(os.environ.get("WAIFU_INPAINT_STEPS", "28"))
     cfg = float(os.environ.get("WAIFU_INPAINT_CFG", "5.0"))
     if strength is None:
-        strength_name = "WAIFU_INPAINT_MASKED_STRENGTH" if has_explicit_mask else "WAIFU_INPAINT_UNMASKED_STRENGTH"
-        strength_default = "0.85" if has_explicit_mask else "0.55"
+        strength_name = "WAIFU_INPAINT_MASKED_STRENGTH" if has_edit_mask else "WAIFU_INPAINT_UNMASKED_STRENGTH"
+        strength_default = "0.85" if has_edit_mask else "0.55"
         strength = float(os.environ.get(strength_name, strength_default))
     final_prompt = fit_prompt_for_sdxl(
         pipe,
@@ -228,10 +304,31 @@ def _edit_hidream(pipe, prompt, image_path, _mask_path, seed, status_callback):
             pass
 
 
-def edit_image(editor_id, pipe, prompt, image_path, mask_path, seed, strength=None, callback=None, status_callback=None):
+def edit_image(
+    editor_id,
+    pipe,
+    prompt,
+    image_path,
+    mask_path,
+    seed,
+    strength=None,
+    callback=None,
+    status_callback=None,
+    edit_scope="background",
+):
     kind = EDITOR_MODELS[editor_id]["kind"]
     if kind == "waifu_inpaint":
-        return _edit_waifu(pipe, prompt, image_path, mask_path, seed, strength, callback)
+        return _edit_waifu(
+            pipe,
+            prompt,
+            image_path,
+            mask_path,
+            seed,
+            strength,
+            callback,
+            edit_scope,
+            status_callback,
+        )
     if kind == "flux_kontext":
         return _edit_flux_kontext(pipe, prompt, image_path, mask_path, seed, callback)
     if kind == "hidream_cli":

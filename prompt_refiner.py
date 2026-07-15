@@ -372,7 +372,25 @@ class LocalPromptRefiner:
             )
         return self.processor.decode(outputs[0][input_len:], skip_special_tokens=True)
 
-    def refine(self, user_prompt, mode, preset_label, preset_hint, style_description, enhance=True):
+    @staticmethod
+    def _workflow_constraint(workflow):
+        if workflow == "character":
+            return (
+                "Character-generation workflow: return one single full-body standing "
+                "character on a simple plain white background. Exclude scenery, rooms, "
+                "weather, horizons, buildings, and environmental effects even when the "
+                "user describes a future scene. Preserve character appearance, outfit, "
+                "accessories, and expression exactly."
+            )
+        if workflow == "compose":
+            return (
+                "Background-composition workflow: describe only the requested background, "
+                "pose, camera, and scene changes. Preserve the existing character identity, "
+                "face, hairstyle, outfit, and all unrequested details."
+            )
+        return "No additional workflow constraint."
+
+    def refine(self, user_prompt, mode, preset_label, preset_hint, style_description, enhance=True, workflow="standard"):
         self._load()
         if mode == "edit":
             system_prompt = EDIT_SYSTEM_PROMPT
@@ -388,6 +406,7 @@ class LocalPromptRefiner:
                 "role": "user",
                 "content": (
                     f"Mode: {mode}\n"
+                    f"Workflow constraint: {self._workflow_constraint(workflow)}\n"
                     f"Style preset: {preset_label}\n"
                     f"Preset visual direction: {preset_hint or 'none'}\n"
                     f"Style preferences:\n{style_description}\n\n"
@@ -416,6 +435,7 @@ class LocalPromptRefiner:
                 "role": "user",
                 "content": (
                     f"Mode: {mode}\n"
+                    f"Workflow constraint: {self._workflow_constraint(workflow)}\n"
                     f"Style direction: {preset_hint or preset_label}\n"
                     f"User request:\n{user_prompt}"
                 ),

@@ -29,7 +29,10 @@ RUN git clone --depth 1 https://github.com/HiDream-ai/HiDream-O1-Image.git /opt/
     && sed -i 's/"use_flash_attn": True/"use_flash_attn": False/' /opt/hidream-o1-image/models/pipeline.py
 
 COPY . /workspace/janku-image-studio
-RUN chmod +x /workspace/janku-image-studio/deploy/vast/entrypoint.sh
+# The repository is also edited from Windows. Normalize the shell script here
+# so both local Docker and Vast.ai always receive a Linux executable.
+RUN sed -i 's/\r$//' /workspace/janku-image-studio/deploy/vast/entrypoint.sh \
+    && chmod +x /workspace/janku-image-studio/deploy/vast/entrypoint.sh
 
 EXPOSE 7861
 CMD ["/workspace/janku-image-studio/deploy/vast/entrypoint.sh"]

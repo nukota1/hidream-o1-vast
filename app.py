@@ -11,13 +11,23 @@ import threading
 import traceback
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
+import numpy as np
 import torch
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template, request
-from PIL import ImageEnhance
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
 
-from image_edit_workflows import EDITOR_MODELS, edit_image, editor_model_choices, load_editor_pipeline, unload_editor
+from image_edit_workflows import (
+    EDITOR_MODELS,
+    edit_image,
+    editor_model_choices,
+    extract_plain_background_mask,
+    load_editor_pipeline,
+    normalize_plain_background,
+    unload_editor,
+)
 from prompt_refiner import LocalPromptRefiner
 from sdxl_janku_workflow import (
     fit_prompt_for_sdxl,
@@ -36,6 +46,7 @@ _STATE = {
     "editor_id": None,
     "refiner": LocalPromptRefiner(),
 }
+_PROMPT_CATALOG = None
 
 IMAGE_MODEL_FAMILY = os.environ.get("IMAGE_MODEL_FAMILY", "janku").strip().lower()
 IMAGE_MODEL_LABEL = os.environ.get(
@@ -48,6 +59,10 @@ BASE_NEGATIVE_PROMPT = (
     "lowres, worst quality, low quality, bad anatomy, bad hands, extra fingers, "
     "missing fingers, malformed limbs, blurry, jpeg artifacts, text, watermark, signature"
 )
+
+PROMPT_CATALOG_PATH = Path(__file__).with_name("ai-nante-prompt-catalog.json")
+WORKFLOW_CHARACTER = "character"
+WORKFLOW_COMPOSE = "compose"
 
 BACKGROUNDLESS_POSITIVE_TAGS = ("simple white background", "plain background", "isolated")
 BACKGROUNDLESS_NEGATIVE_TAGS = (
@@ -78,6 +93,39 @@ BACKGROUNDLESS_NEGATIVE_TAGS = (
     "puddle",
     "sunset",
     "sunrise",
+)
+CHARACTER_REQUIRED_TAGS = (
+    "solo",
+    "full body",
+    "standing",
+    "simple white background",
+    "plain background",
+    "pure white background",
+    "isolated",
+)
+CHARACTER_NEGATIVE_TAGS = (
+    *BACKGROUNDLESS_NEGATIVE_TAGS,
+    "detailed scenery",
+    "busy background",
+    "environment",
+    "environmental effects",
+    "gradient background",
+    "gray background",
+    "coloured background",
+    "geometric background",
+    "studio backdrop",
+    "floor",
+    "spotlight",
+    "background shadow",
+    "cropped",
+    "upper body",
+    "portrait",
+    "close-up",
+    "sitting",
+    "lying",
+    "kneeling",
+    "multiple views",
+    "character sheet",
 )
 BACKGROUNDLESS_JAPANESE_PATTERNS = (
     r"背景\s*(?:を|は)?\s*(?:描かない|描くな|描かなくて|不要|いらない|なし|無し|省略)",
@@ -414,13 +462,10 @@ def _is_background_scene_tag(tag):
         "building",
         "furniture",
         "horizon",
-        "road",
-        "school",
         "beach",
         "mountain",
         "river",
         "garden",
-        "field",
         "alley",
         "rain",
         "snow",
@@ -431,7 +476,13 @@ def _is_background_scene_tag(tag):
         "school yard",
         "classroom",
     )
-    return any(term in value for term in scene_terms)
+    if any(term in value for term in scene_terms):
+        return True
+    return bool(re.search(
+        r"\b(?:rural |country |dirt )?road\b|\b(?:open )?field\b|"
+        r"\bschool(?:yard| yard| building| campus)\b",
+        value,
+    ))
 
 
 def apply_background_suppression(prompt_info, settings):
@@ -458,6 +509,154 @@ def apply_background_suppression(prompt_info, settings):
         "isolated subject on a simple white background."
     ).strip()
     return prompt_info
+
+
+def apply_character_constraints(prompt_info, settings):
+    """Make the character workflow a full-body standing portrait on white only."""
+    quality_tags = ["masterpiece", "high score", "great score", "absurdres"]
+    preset = STYLE_PRESETS[settings["preset"]]
+    style_control_tags = style_adjustment_tags(settings["style"], preset["style"])
+    preset_style_tags = preset.get("positive_style_tags", [])
+    style_tag_keys = {tag.lower() for tag in [*style_control_tags, *preset_style_tags]}
+    blocked_character_tags = (
+        "sitting", "lying", "kneeling", "upper body", "portrait", "close-up",
+        "background", "scenery", "landscape", "environment", "weather", "outdoors", "indoors", "room",
+    )
+    tags = [tag.strip() for tag in prompt_info["prompt"].split(",") if tag.strip()]
+    quality = [tag for tag in tags if tag.lower() in {item.lower() for item in quality_tags}]
+    character_tags = [
+        tag for tag in tags
+        if tag.lower() not in {item.lower() for item in quality_tags}
+        and tag.lower() not in style_tag_keys
+        and not _is_background_scene_tag(tag)
+        and not any(blocked in tag.lower() for blocked in blocked_character_tags)
+    ]
+    # Keep a compact rendering direction, but leave the CLIP budget primarily
+    # for the character facts the user has chosen or written.
+    character_style_tags = [
+        *style_control_tags[:2],
+        *preset_style_tags[:4],
+    ]
+    prompt_info["prompt"] = join_unique_tags(
+        CHARACTER_REQUIRED_TAGS,
+        character_tags,
+        character_style_tags,
+        quality if quality else (quality_tags if IMAGE_MODEL_FAMILY == "animagine" else ()),
+    )
+    outerwear_terms = ("jacket", "coat", "cape", "cardigan", "hoodie", "blazer")
+    unrequested_outerwear = () if any(
+        term in prompt_info["prompt"].lower() for term in outerwear_terms
+    ) else outerwear_terms
+    settings["negative_prompt"] = join_unique_tags(
+        settings["negative_prompt"].split(","),
+        CHARACTER_NEGATIVE_TAGS,
+        unrequested_outerwear,
+    )
+    prompt_info["intent_notes"] = (
+        f"{prompt_info.get('intent_notes', '')} Character workflow enforced: "
+        "single full-body standing character on a plain white background."
+    ).strip()
+    return prompt_info
+
+
+def _load_prompt_catalog():
+    global _PROMPT_CATALOG
+    if _PROMPT_CATALOG is not None:
+        return _PROMPT_CATALOG
+    if not PROMPT_CATALOG_PATH.is_file():
+        raise RuntimeError("Prompt catalog file is missing.")
+
+    # Accept catalog exports from both UTF-8 and UTF-8-with-BOM editors.
+    with PROMPT_CATALOG_PATH.open("r", encoding="utf-8-sig") as f:
+        source = json.load(f)
+
+    categories = []
+    subcategories_by_category = {}
+    records = []
+    for category in source.get("categories", []):
+        category_id = str(category.get("id") or "uncategorized")
+        category_title = str(category.get("title") or category_id)
+        before = len(records)
+        article_sources = [
+            ("", "", article)
+            for article in category.get("articles", [])
+        ]
+        for subcategory in category.get("subcategories", []):
+            subcategory_id = str(subcategory.get("id") or "subcategory")
+            subcategory_title = str(subcategory.get("title") or subcategory_id)
+            article_sources.extend(
+                (subcategory_id, subcategory_title, article)
+                for article in subcategory.get("articles", [])
+            )
+        for subcategory_id, subcategory_title, article in article_sources:
+            article_id = str(article.get("id") or "article")
+            for table_index, table in enumerate(article.get("tables", [])):
+                table_title = str(table.get("title") or article.get("title") or category_title)
+                group = " / ".join(
+                    value for value in (subcategory_title, table_title) if value
+                )
+                for row_index, row in enumerate(table.get("rows", [])):
+                    prompt = str(row.get("prompt") or "").strip()
+                    if not prompt:
+                        continue
+                    name = str(row.get("name") or prompt).strip()
+                    description = str(row.get("description") or "").strip()
+                    records.append({
+                        "id": f"{category_id}:{subcategory_id or 'root'}:{article_id}:{table_index}:{row_index}",
+                        "category": category_id,
+                        "subcategory": subcategory_id,
+                        "subcategory_title": subcategory_title,
+                        "name": name,
+                        "prompt": prompt,
+                        "description": description,
+                        "group": group,
+                        "search": " ".join((name, prompt, description, group)).casefold(),
+                    })
+        categories.append({
+            "id": category_id,
+            "title": category_title,
+            "count": len(records) - before,
+        })
+        subcategories_by_category[category_id] = [
+            {
+                "id": str(subcategory.get("id") or "subcategory"),
+                "title": str(subcategory.get("title") or subcategory.get("id") or "中分類"),
+            }
+            for subcategory in category.get("subcategories", [])
+        ]
+
+    _PROMPT_CATALOG = {
+        "categories": categories,
+        "subcategories": subcategories_by_category,
+        "records": records,
+    }
+    return _PROMPT_CATALOG
+
+
+def prompt_catalog_results(query="", category_id="", subcategory_id="", limit=96, offset=0):
+    catalog = _load_prompt_catalog()
+    terms = [term.casefold() for term in str(query).split() if term.strip()]
+    matches = []
+    total = 0
+    for item in catalog["records"]:
+        if category_id and item["category"] != category_id:
+            continue
+        if subcategory_id and item["subcategory"] != subcategory_id:
+            continue
+        if terms and not all(term in item["search"] for term in terms):
+            continue
+        if total >= offset and len(matches) < limit:
+            matches.append({key: value for key, value in item.items() if key != "search"})
+        total += 1
+    next_offset = offset + len(matches)
+    return {
+        "categories": catalog["categories"],
+        "subcategories": catalog["subcategories"].get(category_id, []) if category_id else [],
+        "items": matches,
+        "total": total,
+        "next_offset": next_offset,
+        "has_more": next_offset < total,
+    }
 
 
 def style_negative_prompt(negative_prompt, style, preset_style, preset_negative_tags=()):
@@ -503,7 +702,112 @@ def apply_image_style_tone(image, settings):
     return image
 
 
-def prepare_prompt(user_prompt, mode, settings, refine_enabled):
+def background_scene_settings(settings, source):
+    """Use source-compatible dimensions and prevent people in a scene-only pass."""
+    scene_settings = {**settings}
+    scene_settings["width"] = normalize_dimension(source.width, settings["width"])
+    scene_settings["height"] = normalize_dimension(source.height, settings["height"])
+    scene_settings["negative_prompt"] = join_unique_tags(
+        settings["negative_prompt"].split(","),
+        (
+            "1girl", "1boy", "person", "people", "character", "face", "body",
+            "hands", "legs", "text", "watermark", "signature",
+        ),
+    )
+    return scene_settings
+
+
+def background_scene_prompt(prompt):
+    quality_tags = ("masterpiece", "high score", "great score", "absurdres")
+    return join_unique_tags(
+        prompt.split(","),
+        (
+            "empty scenery",
+            "clear open foreground space in the center",
+            "visible ground plane",
+            "coherent cinematic environmental lighting",
+        ),
+        quality_tags if IMAGE_MODEL_FAMILY == "animagine" else (),
+    )
+
+
+def _scene_ambient_colour(background, foreground_alpha):
+    """Estimate local scene light from a ring around the character silhouette."""
+    alpha = foreground_alpha.convert("L")
+    width, height = alpha.size
+    kernel = max(21, min(101, int(max(width, height) * 0.08) // 2 * 2 + 1))
+    expanded = alpha.filter(ImageFilter.MaxFilter(size=kernel))
+    alpha_array = np.asarray(alpha)
+    ring = (np.asarray(expanded) > 0) & (alpha_array < 8)
+    pixels = np.asarray(background.convert("RGB"), dtype=np.float32)
+    if ring.sum() < 128:
+        ring = alpha_array < 8
+    return np.median(pixels[ring], axis=0) if ring.any() else np.array([160.0, 160.0, 160.0])
+
+
+def _add_contact_shadow(background, foreground_alpha):
+    """Give a full-body foreground a soft shadow where it meets the ground."""
+    alpha_array = np.asarray(foreground_alpha.convert("L"))
+    ys, xs = np.where(alpha_array > 160)
+    if not len(xs):
+        return background.convert("RGB")
+    width, height = background.size
+    left, right = int(xs.min()), int(xs.max())
+    baseline = min(height - 1, int(ys.max()) + max(2, int(height * 0.008)))
+    shadow_width = max(32, int((right - left + 1) * 0.58))
+    shadow_height = max(10, int(height * 0.028))
+    center_x = (left + right) // 2
+    shadow = Image.new("L", background.size, color=0)
+    ImageDraw.Draw(shadow).ellipse(
+        (
+            center_x - shadow_width // 2,
+            baseline - shadow_height // 2,
+            center_x + shadow_width // 2,
+            baseline + shadow_height // 2,
+        ),
+        fill=92,
+    )
+    shadow = shadow.filter(ImageFilter.GaussianBlur(radius=max(5, int(width * 0.018))))
+    shadow_layer = Image.new("RGBA", background.size, (0, 0, 0, 0))
+    shadow_layer.putalpha(shadow)
+    return Image.alpha_composite(background.convert("RGBA"), shadow_layer).convert("RGB")
+
+
+def composite_foreground_over_scene(source, background, background_mask):
+    """Composite a white-background character with edge cleanup and scene lighting."""
+    if background.size != source.size:
+        background = background.resize(source.size, Image.Resampling.LANCZOS)
+    foreground_alpha = ImageOps.invert(background_mask.convert("L").resize(source.size))
+    ambient = _scene_ambient_colour(background, foreground_alpha)
+    foreground = np.asarray(source.convert("RGB"), dtype=np.float32)
+    scene = np.asarray(_add_contact_shadow(background, foreground_alpha), dtype=np.float32)
+    alpha = np.asarray(
+        foreground_alpha.filter(ImageFilter.GaussianBlur(radius=1.15)),
+        dtype=np.float32,
+    ) / 255.0
+    alpha_3d = alpha[..., None]
+
+    # The source was generated over white. Remove that white contribution only
+    # along antialiased edges, then apply a restrained scene colour cast.
+    safe_alpha = np.maximum(alpha_3d, 0.14)
+    decontaminated = np.clip(
+        (foreground - (1.0 - alpha_3d) * 255.0) / safe_alpha,
+        0.0,
+        255.0,
+    )
+    subject = np.where(alpha_3d < 0.985, decontaminated, foreground)
+    ambient_luma = float(np.dot(ambient, [0.2126, 0.7152, 0.0722]))
+    brightness = float(np.clip(0.82 + ambient_luma / 1000.0, 0.88, 1.05))
+    neutral = max(float(ambient.mean()), 1.0)
+    colour_cast = np.clip(ambient / neutral, 0.85, 1.15)
+    subject *= brightness * (1.0 + (colour_cast - 1.0) * 0.14)
+    subject = np.clip(subject, 0.0, 255.0)
+
+    result = subject * alpha_3d + scene * (1.0 - alpha_3d)
+    return Image.fromarray(np.uint8(np.clip(result, 0.0, 255.0)), mode="RGB")
+
+
+def prepare_prompt(user_prompt, mode, settings, refine_enabled, workflow=WORKFLOW_CHARACTER):
     preset = STYLE_PRESETS[settings["preset"]]
     adjustment_tags = style_adjustment_tags(settings["style"], preset["style"]) if mode == "t2i" else []
     preset_style_tags = preset.get("positive_style_tags", []) if mode == "t2i" else []
@@ -521,6 +825,7 @@ def prepare_prompt(user_prompt, mode, settings, refine_enabled):
                 preset_hint=refiner_preset_hint,
                 style_description=style_description,
                 enhance=refine_enabled,
+                workflow=workflow,
             )
             if preset_style_tags or adjustment_tags:
                 # Animagine follows ordered tags. User-requested composition and
@@ -678,15 +983,35 @@ def api_save_to_r2():
         return jsonify({"error": str(exc)}), 500
 
 
+@app.route("/api/prompt-catalog")
+def api_prompt_catalog():
+    query = str(request.args.get("q") or "").strip()
+    category_id = str(request.args.get("category") or "").strip()
+    subcategory_id = str(request.args.get("subcategory") or "").strip()
+    limit = clamp_int(request.args.get("limit"), 96, 12, 120)
+    offset = clamp_int(request.args.get("offset"), 0, 0, 100000)
+    try:
+        return jsonify(prompt_catalog_results(query, category_id, subcategory_id, limit, offset))
+    except Exception as exc:
+        return jsonify({"error": f"Prompt catalog could not be loaded: {exc}"}), 500
+
+
 @app.route("/api/generate/start", methods=["POST"])
 def api_generate_start():
     data = request.get_json(force=True)
     prompt = str(data.get("prompt") or "").strip()
     mode = str(data.get("mode") or "t2i")
+    workflow = str(data.get("workflow") or WORKFLOW_CHARACTER)
     if not prompt:
         return jsonify({"error": "プロンプトを入力してください。"}), 400
     if mode not in {"t2i", "edit"}:
         return jsonify({"error": f"Unknown mode: {mode}"}), 400
+    if workflow not in {WORKFLOW_CHARACTER, WORKFLOW_COMPOSE}:
+        return jsonify({"error": f"Unknown workflow: {workflow}"}), 400
+    if workflow == WORKFLOW_CHARACTER and mode != "t2i":
+        return jsonify({"error": "Character workflow must use text-to-image generation."}), 400
+    if workflow == WORKFLOW_COMPOSE and mode != "edit":
+        return jsonify({"error": "Compose workflow must use image editing."}), 400
     source_image = str(data.get("source_image") or "").strip()
     if mode == "edit" and not source_image:
         return jsonify({"error": "編集元の画像が必要です。"}), 400
@@ -694,7 +1019,11 @@ def api_generate_start():
     settings = normalize_generation_settings(data)
     refine_enabled = bool(data.get("refine_enabled", True))
     mask_b64 = str(data.get("mask_image") or "").strip()
+    background_mask_b64 = str(data.get("background_mask_image") or "").strip()
     edit_strength = clamp_float(data.get("edit_strength"), 0.55, 0.10, 0.95)
+    edit_scope = str(data.get("edit_scope") or "background")
+    if edit_scope not in {"background", "full"}:
+        return jsonify({"error": f"Unknown edit scope: {edit_scope}"}), 400
     editor_id = str(data.get("editor_model") or "waifu_inpaint_xl")
     if mode == "edit" and editor_id not in EDITOR_MODELS:
         return jsonify({"error": f"Unknown image editor: {editor_id}"}), 400
@@ -704,10 +1033,13 @@ def api_generate_start():
 
     def worker():
         temp_paths = []
+        generated_background_mask = ""
         try:
             q.put({"type": "status", "phase": "refine", "message": "プロンプトを準備しています"})
-            prompt_info = prepare_prompt(prompt, mode, settings, refine_enabled)
-            if background_suppression_requested(prompt, mode):
+            prompt_info = prepare_prompt(prompt, mode, settings, refine_enabled, workflow=workflow)
+            if workflow == WORKFLOW_CHARACTER:
+                prompt_info = apply_character_constraints(prompt_info, settings)
+            elif background_suppression_requested(prompt, mode):
                 prompt_info = apply_background_suppression(prompt_info, settings)
             _STATE["refiner"].unload_if_cuda()
             q.put({
@@ -729,30 +1061,70 @@ def api_generate_start():
                     if mask_b64:
                         mask_path = decode_image_to_temp(mask_b64, "janku_mask")
                         temp_paths.append(mask_path)
-                    q.put({
-                        "type": "status",
-                        "phase": "generate",
-                        "message": f"{EDITOR_MODELS[editor_id]['label']} を準備しています",
-                    })
-                    unload_pipeline("janku_pipe")
-                    if _STATE["editor_id"] != editor_id:
-                        unload_active_editor()
-                    if _STATE["editor_pipe"] is None:
-                        def editor_status(message):
-                            q.put({"type": "status", "phase": "generate", "message": message})
-                        _STATE["editor_pipe"] = load_editor_pipeline(editor_id, status_callback=editor_status)
-                        _STATE["editor_id"] = editor_id
-                    image = edit_image(
-                        editor_id,
-                        _STATE["editor_pipe"],
-                        prompt_info["prompt"],
-                        source_path,
-                        mask_path,
-                        settings["seed"],
-                        strength=edit_strength,
-                        callback=progress,
-                        status_callback=lambda message: q.put({"type": "status", "phase": "generate", "message": message}),
+                    scene_mask_path = None
+                    if background_mask_b64:
+                        scene_mask_path = decode_image_to_temp(background_mask_b64, "janku_background_mask")
+                        temp_paths.append(scene_mask_path)
+                    source, plain_background_mask = extract_plain_background_mask(source_path)
+                    if scene_mask_path:
+                        plain_background_mask = Image.open(scene_mask_path).convert("L").resize(source.size)
+                    use_scene_compositor = (
+                        editor_id == "waifu_inpaint_xl"
+                        and edit_scope == "background"
+                        and mask_path is None
+                        and plain_background_mask is not None
                     )
+                    if use_scene_compositor:
+                        q.put({
+                            "type": "status",
+                            "phase": "generate",
+                            "message": "人物を保持し、背景用のシーンを生成しています",
+                        })
+                        unload_active_editor()
+                        if _STATE["janku_pipe"] is None:
+                            def model_status(message):
+                                q.put({"type": "status", "phase": "generate", "message": message})
+                            _STATE["janku_pipe"] = load_janku_pipeline(status_callback=model_status)
+                        scene_settings = background_scene_settings(settings, source)
+                        scene_prompt = background_scene_prompt(prompt_info["prompt"])
+                        fitted_prompt = fit_prompt_for_sdxl(_STATE["janku_pipe"], scene_prompt)
+                        prompt_info["prompt"] = fitted_prompt
+                        background = generate_with_janku(
+                            _STATE["janku_pipe"],
+                            fitted_prompt,
+                            scene_settings,
+                            callback=progress,
+                        )
+                        image = composite_foreground_over_scene(source, background, plain_background_mask)
+                        mask_buffer = io.BytesIO()
+                        plain_background_mask.save(mask_buffer, format="PNG")
+                        generated_background_mask = base64.b64encode(mask_buffer.getvalue()).decode("ascii")
+                    else:
+                        q.put({
+                            "type": "status",
+                            "phase": "generate",
+                            "message": f"{EDITOR_MODELS[editor_id]['label']} を準備しています",
+                        })
+                        unload_pipeline("janku_pipe")
+                        if _STATE["editor_id"] != editor_id:
+                            unload_active_editor()
+                        if _STATE["editor_pipe"] is None:
+                            def editor_status(message):
+                                q.put({"type": "status", "phase": "generate", "message": message})
+                            _STATE["editor_pipe"] = load_editor_pipeline(editor_id, status_callback=editor_status)
+                            _STATE["editor_id"] = editor_id
+                        image = edit_image(
+                            editor_id,
+                            _STATE["editor_pipe"],
+                            prompt_info["prompt"],
+                            source_path,
+                            mask_path,
+                            settings["seed"],
+                            strength=edit_strength,
+                            callback=progress,
+                            status_callback=lambda message: q.put({"type": "status", "phase": "generate", "message": message}),
+                            edit_scope=edit_scope,
+                        )
                 else:
                     q.put({"type": "status", "phase": "generate", "message": f"{IMAGE_MODEL_LABEL}を準備しています"})
                     unload_active_editor()
@@ -775,6 +1147,7 @@ def api_generate_start():
                         callback=progress,
                     )
                     image = apply_image_style_tone(image, settings)
+                    image = normalize_plain_background(image)
 
             buf = io.BytesIO()
             image.save(buf, format="PNG")
@@ -788,7 +1161,10 @@ def api_generate_start():
                 "settings": settings,
                 "editor_model": editor_id if mode == "edit" else None,
                 "edit_strength": edit_strength if mode == "edit" else None,
+                "edit_scope": edit_scope if mode == "edit" else None,
+                "background_mask": generated_background_mask or None,
                 "refine_enabled": refine_enabled,
+                "workflow": workflow,
             })
         except Exception as exc:
             traceback.print_exc()
