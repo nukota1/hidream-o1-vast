@@ -28,8 +28,42 @@ fi
 : "${HIDREAM_O1_IMAGE_PATH:=/models/HiDream-O1-Image}"
 : "${PROMPT_REFINER_MODEL:=Qwen/Qwen3.5-9B}"
 : "${PROMPT_REFINER_DOWNLOAD_ON_START:=1}"
+: "${RUNTIME_SETUP_ON_START:=1}"
+: "${PYTORCH_INDEX_URL:=https://download.pytorch.org/whl/cu128}"
+: "${PYTORCH_VERSION:=2.7.1}"
+: "${TORCHVISION_VERSION:=0.22.1}"
 
 export HF_HOME
+
+runtime_dependencies_ready() {
+  python3 -c 'import torch, transformers, diffusers, flask, boto3; assert torch.cuda.is_available()' >/dev/null 2>&1
+}
+
+install_runtime_dependencies() {
+  if runtime_dependencies_ready; then
+    echo "[entrypoint] Python and CUDA dependencies are already installed."
+    return 0
+  fi
+
+  echo "[entrypoint] Installing PyTorch CUDA ${PYTORCH_VERSION} and application dependencies."
+  echo "[entrypoint] This runs only on a fresh disk and can take several minutes."
+  python3 -m pip install --no-cache-dir --upgrade pip
+  python3 -m pip install --no-cache-dir \
+    --index-url "$PYTORCH_INDEX_URL" \
+    "torch==${PYTORCH_VERSION}+cu128" \
+    "torchvision==${TORCHVISION_VERSION}+cu128"
+  python3 -m pip install --no-cache-dir -r /workspace/janku-image-studio/requirements-docker.txt
+
+  if [ ! -d /opt/hidream-o1-image/.git ]; then
+    echo "[entrypoint] Downloading optional HiDream editor source."
+    git clone --depth 1 https://github.com/HiDream-ai/HiDream-O1-Image.git /opt/hidream-o1-image
+  fi
+  sed -E '/^(torch|torchvision|transformers|flash-attn)/d' /opt/hidream-o1-image/requirements.txt > /tmp/hidream-requirements.txt
+  python3 -m pip install --no-cache-dir -r /tmp/hidream-requirements.txt
+  sed -i 's/"use_flash_attn": True/"use_flash_attn": False/' /opt/hidream-o1-image/models/pipeline.py
+
+  runtime_dependencies_ready
+}
 
 file_size_bytes() {
   local path="$1"
@@ -132,6 +166,10 @@ if [ "$IMAGE_MODEL_FAMILY" = "animagine" ]; then
 else
   echo "[entrypoint] JANKU cache: s3://$JANKU_R2_BUCKET/$JANKU_R2_KEY"
   echo "[entrypoint] JANKU path: $JANKU_MODEL_PATH"
+fi
+
+if [ "$RUNTIME_SETUP_ON_START" = "1" ]; then
+  install_runtime_dependencies
 fi
 
 if [ "$MODEL_DOWNLOAD_ON_START" = "1" ]; then

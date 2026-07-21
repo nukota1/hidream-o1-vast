@@ -3,10 +3,10 @@
 ## Vast.ai template
 
 ```text
-Image: ghcr.io/nukota1/hidream-o1-image:latest
+Image: nukota0615/hidream-o1-image:latest
 Launch mode: Docker ENTRYPOINT
-Container disk: 100GB or more for the default editor
-Port: 7861
+Container disk: 120GB or more for the default editor
+Internal port: 7861 (Vast.ai assigns the external port after startup)
 ```
 
 Set the variables from `vast/env.vast.example`. Required secret values are:
@@ -23,8 +23,13 @@ production launch.
 
 ## Model lifecycle
 
-The container does not contain model weights. At startup it begins background
-prefetch for:
+The published container is intentionally lightweight. On a fresh Vast.ai disk,
+the entrypoint first installs CUDA PyTorch and Python dependencies. This can take
+several minutes, but runs after the container has started and is visible in the
+instance logs. It is skipped after the dependencies are installed on the disk.
+
+The container does not contain model weights. After the Python setup, it begins
+background prefetch for:
 
 1. JANKU v7.77 from private R2
 2. Waifu-Inpaint-XL, the default editor, from Hugging Face
