@@ -1,29 +1,20 @@
-FROM python:3.10-slim
+# Vast.ai pre-caches this base image on host machines. Keeping our own layer
+# limited to application source avoids long registry downloads during rental.
+FROM vastai/base-image:cuda-12.8.1-cudnn-devel-ubuntu22.04-py310
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    HF_HOME=/models/huggingface \
+ENV HF_HOME=/models/huggingface \
     APP_HOST=0.0.0.0 \
     APP_PORT=7861 \
     MODEL_TORCH_DTYPE=auto
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        bash \
-        ca-certificates \
-        git \
-        libglib2.0-0 \
-        libgl1 \
-    && rm -rf /var/lib/apt/lists/*
+# The Vast base image copies this directory to /workspace on first boot.
+COPY . /opt/workspace-internal/janku-image-studio
+COPY deploy/vast/janku-image-studio.conf /etc/supervisor/conf.d/janku-image-studio.conf
+COPY deploy/vast/run-janku-image-studio.sh /opt/supervisor-scripts/janku-image-studio.sh
 
-WORKDIR /workspace/janku-image-studio
-
-COPY . /workspace/janku-image-studio
-# The repository is also edited from Windows. Normalize the shell script here
-# so both local Docker and Vast.ai always receive a Linux executable.
-RUN sed -i 's/\r$//' /workspace/janku-image-studio/deploy/vast/entrypoint.sh \
-    && chmod +x /workspace/janku-image-studio/deploy/vast/entrypoint.sh
+RUN dos2unix /opt/workspace-internal/janku-image-studio/deploy/vast/entrypoint.sh \
+    /opt/supervisor-scripts/janku-image-studio.sh \
+    && chmod +x /opt/workspace-internal/janku-image-studio/deploy/vast/entrypoint.sh \
+    /opt/supervisor-scripts/janku-image-studio.sh
 
 EXPOSE 7861
-CMD ["/workspace/janku-image-studio/deploy/vast/entrypoint.sh"]

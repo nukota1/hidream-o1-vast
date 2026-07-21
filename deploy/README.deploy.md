@@ -23,10 +23,12 @@ production launch.
 
 ## Model lifecycle
 
-The published container is intentionally lightweight. On a fresh Vast.ai disk,
-the entrypoint first installs CUDA PyTorch and Python dependencies. This can take
-several minutes, but runs after the container has started and is visible in the
-instance logs. It is skipped after the dependencies are installed on the disk.
+The published image extends Vast.ai's pre-cached CUDA base image. Only the
+application source is pulled when renting a new instance. On a fresh Vast.ai
+disk, the entrypoint then installs CUDA PyTorch and Python dependencies. This
+can take several minutes, but runs after the container has started and is
+visible in the instance logs. It is skipped after the dependencies are
+installed on the disk.
 
 The container does not contain model weights. After the Python setup, it begins
 background prefetch for:
