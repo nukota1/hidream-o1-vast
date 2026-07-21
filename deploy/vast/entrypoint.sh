@@ -35,6 +35,21 @@ fi
 
 export HF_HOME
 
+pip_install_with_retry() {
+  local attempt=1
+  local max_attempts=5
+
+  until python3 -m pip install --no-cache-dir --retries 10 --timeout 120 "$@"; do
+    if [ "$attempt" -ge "$max_attempts" ]; then
+      echo "[entrypoint] pip install failed after ${max_attempts} attempts."
+      return 1
+    fi
+    echo "[entrypoint] pip install interrupted; retrying in $((attempt * 20)) seconds (${attempt}/${max_attempts})."
+    sleep "$((attempt * 20))"
+    attempt=$((attempt + 1))
+  done
+}
+
 runtime_dependencies_ready() {
   python3 -c 'import torch, transformers, diffusers, flask, boto3; assert torch.cuda.is_available()' >/dev/null 2>&1
 }
@@ -47,19 +62,19 @@ install_runtime_dependencies() {
 
   echo "[entrypoint] Installing PyTorch CUDA ${PYTORCH_VERSION} and application dependencies."
   echo "[entrypoint] This runs only on a fresh disk and can take several minutes."
-  python3 -m pip install --no-cache-dir --upgrade pip
-  python3 -m pip install --no-cache-dir \
+  pip_install_with_retry --upgrade pip
+  pip_install_with_retry \
     --index-url "$PYTORCH_INDEX_URL" \
     "torch==${PYTORCH_VERSION}+cu128" \
     "torchvision==${TORCHVISION_VERSION}+cu128"
-  python3 -m pip install --no-cache-dir -r /workspace/janku-image-studio/requirements-docker.txt
+  pip_install_with_retry -r /workspace/janku-image-studio/requirements-docker.txt
 
   if [ ! -d /opt/hidream-o1-image/.git ]; then
     echo "[entrypoint] Downloading optional HiDream editor source."
     git clone --depth 1 https://github.com/HiDream-ai/HiDream-O1-Image.git /opt/hidream-o1-image
   fi
   sed -E '/^(torch|torchvision|transformers|flash-attn)/d' /opt/hidream-o1-image/requirements.txt > /tmp/hidream-requirements.txt
-  python3 -m pip install --no-cache-dir -r /tmp/hidream-requirements.txt
+  pip_install_with_retry -r /tmp/hidream-requirements.txt
   sed -i 's/"use_flash_attn": True/"use_flash_attn": False/' /opt/hidream-o1-image/models/pipeline.py
 
   runtime_dependencies_ready
