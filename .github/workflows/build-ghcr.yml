@@ -1,4 +1,4 @@
-name: Build and Push GHCR
+name: Build and Push Container Images
 
 on:
   workflow_dispatch:
@@ -35,6 +35,13 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: nukota0615
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -44,3 +51,5 @@ jobs:
           tags: |
             ghcr.io/nukota1/hidream-o1-image:latest
             ghcr.io/nukota1/hidream-o1-image:${{ github.sha }}
+            nukota0615/hidream-o1-image:latest
+            nukota0615/hidream-o1-image:${{ github.sha }}
