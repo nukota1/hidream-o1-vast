@@ -1,0 +1,14 @@
+{
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "d1:migrate": "wrangler d1 migrations apply janku-image-studio --remote",
+    "dev": "wrangler dev"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  },
+  "dependencies": {
+    "jose": "^6.1.0"
+  }
+}

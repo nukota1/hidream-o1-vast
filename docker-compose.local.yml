@@ -17,6 +17,7 @@ services:
       APP_NAME: Animagine Image Studio
       IMAGE_MODEL_FAMILY: animagine
       IMAGE_MODEL_LABEL: Animagine XL 4.0 Opt
+      PROMPT_REFINER_LOCAL_FILES_ONLY: "1"
       ANIMAGINE_MODEL_REPO: cagliostrolab/animagine-xl-4.0
       ANIMAGINE_MODEL_FILE: animagine-xl-4.0-opt.safetensors
       ANIMAGINE_MODEL_PATH: /models/checkpoints/animagine-xl-4.0-opt.safetensors

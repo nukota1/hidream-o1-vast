@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image, ImageOps
+from PIL import Image, ImageFilter, ImageOps
 
 from sdxl_janku_workflow import fit_prompt_for_sdxl
 
@@ -160,7 +160,15 @@ def _automatic_background_mask(source):
 def extract_plain_background_mask(image_path):
     """Load a source image and return its reusable plain-background mask."""
     source = Image.open(image_path).convert("RGB")
-    return source, _automatic_background_mask(source)
+    mask = _automatic_background_mask(source)
+    return source, _feather_background_mask(mask) if mask is not None else None
+
+
+def _feather_background_mask(mask):
+    """Let inpainting redraw a narrow edge so the subject does not look pasted."""
+    return mask.filter(ImageFilter.MaxFilter(5)).filter(
+        ImageFilter.GaussianBlur(radius=0.8)
+    )
 
 
 def normalize_plain_background(image):
@@ -184,7 +192,7 @@ def _load_source_and_mask(image_path, mask_path, edit_scope, status_callback=Non
         if mask is not None:
             if status_callback:
                 status_callback("立ち絵の無地背景を抽出しています")
-            return source, mask, True
+            return source, _feather_background_mask(mask), True
     # Pose changes and arbitrary source images need full-image editing. It is
     # paired with a low denoising strength to retain the source when possible.
     if status_callback:
@@ -201,7 +209,18 @@ def _step_callback(callback, total):
     return on_step_end
 
 
-def _edit_waifu(pipe, prompt, image_path, mask_path, seed, strength, callback, edit_scope, status_callback):
+def _edit_waifu(
+    pipe,
+    prompt,
+    negative_prompt,
+    image_path,
+    mask_path,
+    seed,
+    strength,
+    callback,
+    edit_scope,
+    status_callback,
+):
     source, mask, has_edit_mask = _load_source_and_mask(
         image_path,
         mask_path,
@@ -214,12 +233,28 @@ def _edit_waifu(pipe, prompt, image_path, mask_path, seed, strength, callback, e
         strength_name = "WAIFU_INPAINT_MASKED_STRENGTH" if has_edit_mask else "WAIFU_INPAINT_UNMASKED_STRENGTH"
         strength_default = "0.85" if has_edit_mask else "0.55"
         strength = float(os.environ.get(strength_name, strength_default))
-    final_prompt = fit_prompt_for_sdxl(
-        pipe,
-        prompt + ", same character, same face, preserve identity, preserve unrequested details",
-    )
+    if edit_scope == "background":
+        final_prompt = fit_prompt_for_sdxl(
+            pipe,
+            prompt
+            + ", detailed environment only, coherent perspective, matching scene lighting, "
+            + "natural contact with the existing foreground subject, no additional characters",
+        )
+        final_negative = (
+            "additional person, second person, duplicate person, duplicate character, "
+            "extra character, background character, crowd, face in background, body in background, "
+            "floating person, pasted character, collage, cutout, mismatched lighting, "
+            + (negative_prompt or "")
+        )
+    else:
+        final_prompt = fit_prompt_for_sdxl(
+            pipe,
+            prompt + ", same character, same face, preserve identity, preserve unrequested details",
+        )
+        final_negative = negative_prompt or ""
     result = pipe(
         prompt=final_prompt,
+        negative_prompt=final_negative,
         image=source,
         mask_image=mask,
         num_inference_steps=steps,
@@ -308,6 +343,7 @@ def edit_image(
     editor_id,
     pipe,
     prompt,
+    negative_prompt,
     image_path,
     mask_path,
     seed,
@@ -321,6 +357,7 @@ def edit_image(
         return _edit_waifu(
             pipe,
             prompt,
+            negative_prompt,
             image_path,
             mask_path,
             seed,

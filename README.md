@@ -124,15 +124,18 @@ starting.
 
 ## Storage
 
-Generated images are saved only when the user presses the R2 save button:
+When accessed through the Cloudflare Worker, generated images are saved
+automatically to private R2 and the gallery metadata is saved to D1:
 
 ```text
-generated/YYYY/MM/DD/<uuid>.png
-generated/YYYY/MM/DD/<uuid>.json
+R2: gallery/<uuid>.png
+D1: gallery_records, gallery_folders, favorite_groups
 ```
 
-The JSON object contains the original prompt, final prompt, selected preset,
-refinement state, generation settings, and object keys.
+The D1 record contains the original prompt, final prompt, selected preset,
+refinement state, generation settings, workflow, and folder. The PNG is streamed
+through the Worker at `/api/gallery/image/<uuid>`. Direct local access keeps an
+IndexedDB fallback for development.
 
 ## Build
 

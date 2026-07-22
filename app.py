@@ -1,6 +1,7 @@
 import argparse
 import base64
 import gc
+import hmac
 import io
 import json
 import os
@@ -13,11 +14,10 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-import numpy as np
 import torch
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template, request
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageEnhance
 
 from image_edit_workflows import (
     EDITOR_MODELS,
@@ -38,6 +38,19 @@ from sdxl_janku_workflow import (
 load_dotenv()
 
 app = Flask(__name__)
+BACKEND_SHARED_SECRET = os.environ.get("BACKEND_SHARED_SECRET", "").strip()
+
+
+@app.before_request
+def require_backend_shared_secret():
+    if not BACKEND_SHARED_SECRET:
+        return None
+    supplied = request.headers.get("X-Backend-Key", "")
+    if not supplied or not hmac.compare_digest(supplied, BACKEND_SHARED_SECRET):
+        return jsonify({"error": "Backend authentication required."}), 401
+    return None
+
+
 _GEN_LOCK = threading.Lock()
 _JOBS = {}
 _STATE = {
@@ -96,12 +109,7 @@ BACKGROUNDLESS_NEGATIVE_TAGS = (
 )
 CHARACTER_REQUIRED_TAGS = (
     "solo",
-    "full body",
-    "standing",
     "simple white background",
-    "plain background",
-    "pure white background",
-    "isolated",
 )
 CHARACTER_NEGATIVE_TAGS = (
     *BACKGROUNDLESS_NEGATIVE_TAGS,
@@ -117,13 +125,6 @@ CHARACTER_NEGATIVE_TAGS = (
     "floor",
     "spotlight",
     "background shadow",
-    "cropped",
-    "upper body",
-    "portrait",
-    "close-up",
-    "sitting",
-    "lying",
-    "kneeling",
     "multiple views",
     "character sheet",
 )
@@ -232,7 +233,8 @@ if IMAGE_MODEL_FAMILY == "animagine":
     animagine_negative = (
         "lowres, bad anatomy, bad hands, text, error, missing finger, extra digits, "
         "fewer digits, cropped, worst quality, low quality, low score, bad score, "
-        "average score, signature, watermark, username, blurry"
+        "average score, signature, watermark, username, blurry, malformed eyes, "
+        "asymmetrical eyes, poorly drawn eyes, colored sclera, eye color spill"
     )
     STYLE_PRESETS["bishoujo_game"].update({
         "prompt_hint": (
@@ -511,15 +513,66 @@ def apply_background_suppression(prompt_info, settings):
     return prompt_info
 
 
+def stabilize_character_eye_tags(tags):
+    """Convert fragile prose-like eye effects into Animagine's stable tags."""
+    eye_colors = (
+        "red", "crimson", "blue", "green", "amber", "gold", "golden",
+        "brown", "gray", "grey", "purple", "violet", "pink", "aqua",
+        "cyan", "black", "orange", "yellow",
+    )
+    risky_terms = (
+        "glassy", "glossy", "glass-like", "glass like", "glass refraction",
+        "refraction", "transparent eyes", "multiple highlights", "many highlights",
+        "detailed eyes", "highly detailed eyes", "catchlight", "vivid tone",
+        "light tone layer",
+    )
+    normalized = []
+    detected_color = ""
+    eye_requested = False
+    for raw_tag in tags:
+        tag = raw_tag.strip()
+        value = tag.lower()
+        if "eye" in value or "iris" in value:
+            for color in eye_colors:
+                if re.search(rf"\b{re.escape(color)}\b", value):
+                    detected_color = "red" if color == "crimson" else (
+                        "gold" if color == "golden" else (
+                            "gray" if color == "grey" else color
+                        )
+                    )
+                    eye_requested = True
+                    break
+            if any(term in value for term in risky_terms):
+                continue
+            if re.search(r"\bcrimson(?: red)? eyes?\b", value):
+                tag = "red eyes"
+                value = tag
+            elif re.search(r"\b(?:red|blue|green|amber|gold|brown|gray|purple|violet|pink|aqua|cyan|black|orange|yellow) irises\b", value):
+                tag = re.sub(r"\birises\b", "eyes", value)
+                value = tag
+        if value not in {item.lower() for item in normalized}:
+            normalized.append(tag)
+
+    if eye_requested:
+        color_tag = f"{detected_color} eyes" if detected_color else ""
+        normalized = [
+            tag for tag in normalized
+            if not color_tag or tag.lower() != color_tag.lower()
+        ]
+        stable = [color_tag] if color_tag else []
+        stable.extend(("gradient eyes", "eye highlights"))
+        normalized = [*stable, *normalized]
+    return normalized
+
+
 def apply_character_constraints(prompt_info, settings):
-    """Make the character workflow a full-body standing portrait on white only."""
+    """Keep the character workflow to one character on white without forcing a pose."""
     quality_tags = ["masterpiece", "high score", "great score", "absurdres"]
     preset = STYLE_PRESETS[settings["preset"]]
     style_control_tags = style_adjustment_tags(settings["style"], preset["style"])
     preset_style_tags = preset.get("positive_style_tags", [])
     style_tag_keys = {tag.lower() for tag in [*style_control_tags, *preset_style_tags]}
     blocked_character_tags = (
-        "sitting", "lying", "kneeling", "upper body", "portrait", "close-up",
         "background", "scenery", "landscape", "environment", "weather", "outdoors", "indoors", "room",
     )
     tags = [tag.strip() for tag in prompt_info["prompt"].split(",") if tag.strip()]
@@ -531,6 +584,7 @@ def apply_character_constraints(prompt_info, settings):
         and not _is_background_scene_tag(tag)
         and not any(blocked in tag.lower() for blocked in blocked_character_tags)
     ]
+    character_tags = stabilize_character_eye_tags(character_tags)
     # Keep a compact rendering direction, but leave the CLIP budget primarily
     # for the character facts the user has chosen or written.
     character_style_tags = [
@@ -547,14 +601,19 @@ def apply_character_constraints(prompt_info, settings):
     unrequested_outerwear = () if any(
         term in prompt_info["prompt"].lower() for term in outerwear_terms
     ) else outerwear_terms
+    character_negative = [
+        tag.strip()
+        for tag in settings["negative_prompt"].split(",")
+        if tag.strip() and tag.strip().lower() != "cropped"
+    ]
     settings["negative_prompt"] = join_unique_tags(
-        settings["negative_prompt"].split(","),
+        character_negative,
         CHARACTER_NEGATIVE_TAGS,
         unrequested_outerwear,
     )
     prompt_info["intent_notes"] = (
         f"{prompt_info.get('intent_notes', '')} Character workflow enforced: "
-        "single full-body standing character on a plain white background."
+        "single character on a plain white background; requested pose and framing preserved."
     ).strip()
     return prompt_info
 
@@ -625,10 +684,39 @@ def _load_prompt_catalog():
             for subcategory in category.get("subcategories", [])
         ]
 
+    footwear_pattern = re.compile(
+        r"\b(?:shoes?|boots?|sneakers?|sandals?|loafers?|slippers?|pumps?|footwear)\b"
+        r"|\b(?:high|low|kitten|stiletto)\s+heels?\b",
+        re.IGNORECASE,
+    )
+    footwear_action_pattern = re.compile(
+        r"^(?:removing|untying|putting on)\b", re.IGNORECASE
+    )
+    footwear_records = []
+    for item in records:
+        prompt_words = item["prompt"].casefold()
+        if not footwear_pattern.search(prompt_words) or footwear_action_pattern.search(prompt_words):
+            continue
+        footwear_records.append({
+            **item,
+            "id": f"virtual-footwear:{item['id']}",
+            "category": "clothing",
+            "subcategory": "footwear",
+            "subcategory_title": "靴・履物",
+            "group": f"靴・履物 / {item['group']}",
+        })
+
+    if footwear_records and "clothing" in subcategories_by_category:
+        subcategories_by_category["clothing"].append({
+            "id": "footwear",
+            "title": "靴・履物（横断）",
+        })
+
     _PROMPT_CATALOG = {
         "categories": categories,
         "subcategories": subcategories_by_category,
         "records": records,
+        "virtual_records": {("clothing", "footwear"): footwear_records},
     }
     return _PROMPT_CATALOG
 
@@ -638,7 +726,10 @@ def prompt_catalog_results(query="", category_id="", subcategory_id="", limit=96
     terms = [term.casefold() for term in str(query).split() if term.strip()]
     matches = []
     total = 0
-    for item in catalog["records"]:
+    source_records = catalog["virtual_records"].get(
+        (category_id, subcategory_id), catalog["records"]
+    )
+    for item in source_records:
         if category_id and item["category"] != category_id:
             continue
         if subcategory_id and item["subcategory"] != subcategory_id:
@@ -702,109 +793,87 @@ def apply_image_style_tone(image, settings):
     return image
 
 
-def background_scene_settings(settings, source):
-    """Use source-compatible dimensions and prevent people in a scene-only pass."""
-    scene_settings = {**settings}
-    scene_settings["width"] = normalize_dimension(source.width, settings["width"])
-    scene_settings["height"] = normalize_dimension(source.height, settings["height"])
-    scene_settings["negative_prompt"] = join_unique_tags(
-        settings["negative_prompt"].split(","),
-        (
-            "1girl", "1boy", "person", "people", "character", "face", "body",
-            "hands", "legs", "text", "watermark", "signature",
-        ),
+def background_inpaint_prompt(prompt):
+    """Remove subject-building tags before masked background inpainting."""
+    subject_terms = re.compile(
+        r"\b(?:1girl|1boy|girl|boy|person|people|character|face|body|hair|eyes?|"
+        r"outfit|dress|skirt|shirt|boots?|shoes?|pose|standing|sitting|solo)\b",
+        re.IGNORECASE,
     )
-    return scene_settings
-
-
-def background_scene_prompt(prompt):
-    quality_tags = ("masterpiece", "high score", "great score", "absurdres")
+    environment_tags = []
+    for tag in re.split(r"[,\n]", prompt):
+        tag = tag.strip()
+        if tag and not subject_terms.search(tag):
+            environment_tags.append(tag)
     return join_unique_tags(
-        prompt.split(","),
+        environment_tags,
         (
-            "empty scenery",
-            "clear open foreground space in the center",
-            "visible ground plane",
-            "coherent cinematic environmental lighting",
+            "detailed environment",
+            "coherent perspective",
+            "matching scene lighting",
+            "empty background without people",
         ),
-        quality_tags if IMAGE_MODEL_FAMILY == "animagine" else (),
     )
 
 
-def _scene_ambient_colour(background, foreground_alpha):
-    """Estimate local scene light from a ring around the character silhouette."""
-    alpha = foreground_alpha.convert("L")
-    width, height = alpha.size
-    kernel = max(21, min(101, int(max(width, height) * 0.08) // 2 * 2 + 1))
-    expanded = alpha.filter(ImageFilter.MaxFilter(size=kernel))
-    alpha_array = np.asarray(alpha)
-    ring = (np.asarray(expanded) > 0) & (alpha_array < 8)
-    pixels = np.asarray(background.convert("RGB"), dtype=np.float32)
-    if ring.sum() < 128:
-        ring = alpha_array < 8
-    return np.median(pixels[ring], axis=0) if ring.any() else np.array([160.0, 160.0, 160.0])
+def apply_event_character_lock(prompt_info, locked_character_prompt, settings):
+    """Merge immutable character tags with separately refined event-scene tags."""
+    quality_tags = ["masterpiece", "high score", "great score", "absurdres"]
+    quality_keys = {tag.lower() for tag in quality_tags}
+    preset = STYLE_PRESETS[settings["preset"]]
+    style_keys = {
+        tag.lower()
+        for tag in [
+            *preset.get("positive_style_tags", []),
+            *style_adjustment_tags(settings["style"], preset["style"]),
+        ]
+    }
+    layout_only = {
+        "simple white background", "plain background",
+        "pure white background", "white background", "isolated",
+    }
+    locked_tags = []
+    for raw_tag in re.split(r"[,\n]", locked_character_prompt):
+        tag = raw_tag.strip()
+        value = tag.lower()
+        if not tag or value in quality_keys or value in style_keys or value in layout_only:
+            continue
+        if _is_background_scene_tag(tag):
+            continue
+        locked_tags.append(tag)
 
-
-def _add_contact_shadow(background, foreground_alpha):
-    """Give a full-body foreground a soft shadow where it meets the ground."""
-    alpha_array = np.asarray(foreground_alpha.convert("L"))
-    ys, xs = np.where(alpha_array > 160)
-    if not len(xs):
-        return background.convert("RGB")
-    width, height = background.size
-    left, right = int(xs.min()), int(xs.max())
-    baseline = min(height - 1, int(ys.max()) + max(2, int(height * 0.008)))
-    shadow_width = max(32, int((right - left + 1) * 0.58))
-    shadow_height = max(10, int(height * 0.028))
-    center_x = (left + right) // 2
-    shadow = Image.new("L", background.size, color=0)
-    ImageDraw.Draw(shadow).ellipse(
-        (
-            center_x - shadow_width // 2,
-            baseline - shadow_height // 2,
-            center_x + shadow_width // 2,
-            baseline + shadow_height // 2,
-        ),
-        fill=92,
+    character_conflicts = re.compile(
+        r"\b(?:1girl|1boy|girl|boy|person|character|face|body|skin|hair|eyes?|"
+        r"dress|skirt|shirt|blouse|sweater|cardigan|jacket|coat|hoodie|uniform|"
+        r"outfit|clothes?|clothing|boots?|shoes?|socks?|stockings?|gloves?|"
+        r"hat|ribbon|jewelry|accessor(?:y|ies))\b",
+        re.IGNORECASE,
     )
-    shadow = shadow.filter(ImageFilter.GaussianBlur(radius=max(5, int(width * 0.018))))
-    shadow_layer = Image.new("RGBA", background.size, (0, 0, 0, 0))
-    shadow_layer.putalpha(shadow)
-    return Image.alpha_composite(background.convert("RGBA"), shadow_layer).convert("RGB")
+    scene_tags = []
+    quality = []
+    for raw_tag in re.split(r"[,\n]", prompt_info["prompt"]):
+        tag = raw_tag.strip()
+        if not tag:
+            continue
+        if tag.lower() in quality_keys:
+            quality.append(tag)
+        elif not character_conflicts.search(tag):
+            scene_tags.append(tag)
 
-
-def composite_foreground_over_scene(source, background, background_mask):
-    """Composite a white-background character with edge cleanup and scene lighting."""
-    if background.size != source.size:
-        background = background.resize(source.size, Image.Resampling.LANCZOS)
-    foreground_alpha = ImageOps.invert(background_mask.convert("L").resize(source.size))
-    ambient = _scene_ambient_colour(background, foreground_alpha)
-    foreground = np.asarray(source.convert("RGB"), dtype=np.float32)
-    scene = np.asarray(_add_contact_shadow(background, foreground_alpha), dtype=np.float32)
-    alpha = np.asarray(
-        foreground_alpha.filter(ImageFilter.GaussianBlur(radius=1.15)),
-        dtype=np.float32,
-    ) / 255.0
-    alpha_3d = alpha[..., None]
-
-    # The source was generated over white. Remove that white contribution only
-    # along antialiased edges, then apply a restrained scene colour cast.
-    safe_alpha = np.maximum(alpha_3d, 0.14)
-    decontaminated = np.clip(
-        (foreground - (1.0 - alpha_3d) * 255.0) / safe_alpha,
-        0.0,
-        255.0,
+    prompt_info["prompt"] = join_unique_tags(
+        locked_tags,
+        scene_tags,
+        quality if quality else (quality_tags if IMAGE_MODEL_FAMILY == "animagine" else ()),
     )
-    subject = np.where(alpha_3d < 0.985, decontaminated, foreground)
-    ambient_luma = float(np.dot(ambient, [0.2126, 0.7152, 0.0722]))
-    brightness = float(np.clip(0.82 + ambient_luma / 1000.0, 0.88, 1.05))
-    neutral = max(float(ambient.mean()), 1.0)
-    colour_cast = np.clip(ambient / neutral, 0.85, 1.15)
-    subject *= brightness * (1.0 + (colour_cast - 1.0) * 0.14)
-    subject = np.clip(subject, 0.0, 255.0)
-
-    result = subject * alpha_3d + scene * (1.0 - alpha_3d)
-    return Image.fromarray(np.uint8(np.clip(result, 0.0, 255.0)), mode="RGB")
+    settings["negative_prompt"] = join_unique_tags(
+        settings["negative_prompt"].split(","),
+        ("different outfit", "changed clothes", "alternate costume"),
+    )
+    prompt_info["intent_notes"] = (
+        f"{prompt_info.get('intent_notes', '')} Character and outfit lock applied from the "
+        "character-generation prompt; white-background-only tags were removed."
+    ).strip()
+    return prompt_info
 
 
 def prepare_prompt(user_prompt, mode, settings, refine_enabled, workflow=WORKFLOW_CHARACTER):
@@ -860,16 +929,28 @@ def prepare_prompt(user_prompt, mode, settings, refine_enabled, workflow=WORKFLO
         source = "disabled"
         notes = "Prompt enhancement was disabled. The input was already English."
 
-    # Keep the selected visual direction before the request in the fallback
-    # path so it survives the SDXL CLIP token limit.
-    parts = []
+    if IMAGE_MODEL_FAMILY == "animagine" and mode == "t2i":
+        quality = ["masterpiece", "high score", "great score", "absurdres"]
+        user_tags = [
+            tag.strip()
+            for tag in re.split(r"[,\n]", user_prompt)
+            if tag.strip() and tag.strip().lower() not in {item.lower() for item in quality}
+        ]
+        prompt = join_unique_tags(
+            user_tags,
+            adjustment_tags,
+            preset_style_tags,
+            quality,
+        )
+        return {"prompt": prompt, "intent_notes": notes, "source": source}
+
+    parts = [user_prompt]
     parts.extend(preset_style_tags)
     if preset["prompt_hint"] and not preset_style_tags:
         parts.append(preset["prompt_hint"])
     style_hint = ", ".join([*adjustment_tags, deterministic_style_hint(settings["style"])])
     if style_hint:
         parts.append(style_hint)
-    parts.append(user_prompt)
     return {"prompt": ", ".join(parts), "intent_notes": notes, "source": source}
 
 
@@ -1010,14 +1091,16 @@ def api_generate_start():
         return jsonify({"error": f"Unknown workflow: {workflow}"}), 400
     if workflow == WORKFLOW_CHARACTER and mode != "t2i":
         return jsonify({"error": "Character workflow must use text-to-image generation."}), 400
-    if workflow == WORKFLOW_COMPOSE and mode != "edit":
-        return jsonify({"error": "Compose workflow must use image editing."}), 400
+    if workflow == WORKFLOW_COMPOSE and mode not in {"edit", "t2i"}:
+        return jsonify({"error": "Compose workflow must use image editing or integrated generation."}), 400
     source_image = str(data.get("source_image") or "").strip()
     if mode == "edit" and not source_image:
         return jsonify({"error": "編集元の画像が必要です。"}), 400
 
     settings = normalize_generation_settings(data)
     refine_enabled = bool(data.get("refine_enabled", True))
+    lock_character_outfit = bool(data.get("lock_character_outfit", False))
+    locked_character_prompt = str(data.get("locked_character_prompt") or "").strip()[:5000]
     mask_b64 = str(data.get("mask_image") or "").strip()
     background_mask_b64 = str(data.get("background_mask_image") or "").strip()
     edit_strength = clamp_float(data.get("edit_strength"), 0.55, 0.10, 0.95)
@@ -1036,9 +1119,39 @@ def api_generate_start():
         generated_background_mask = ""
         try:
             q.put({"type": "status", "phase": "refine", "message": "プロンプトを準備しています"})
-            prompt_info = prepare_prompt(prompt, mode, settings, refine_enabled, workflow=workflow)
+            prompt_workflow = (
+                ("event_scene" if lock_character_outfit and locked_character_prompt else "event_cg")
+                if workflow == WORKFLOW_COMPOSE and mode == "t2i"
+                else (
+                    "compose_background"
+                    if workflow == WORKFLOW_COMPOSE and edit_scope == "background"
+                    else workflow
+                )
+            )
+            prompt_info = prepare_prompt(
+                prompt, mode, settings, refine_enabled, workflow=prompt_workflow
+            )
             if workflow == WORKFLOW_CHARACTER:
                 prompt_info = apply_character_constraints(prompt_info, settings)
+            elif (
+                workflow == WORKFLOW_COMPOSE
+                and mode == "t2i"
+                and lock_character_outfit
+                and locked_character_prompt
+            ):
+                prompt_info = apply_event_character_lock(
+                    prompt_info, locked_character_prompt, settings
+                )
+            elif (
+                workflow == WORKFLOW_COMPOSE
+                and mode == "edit"
+                and edit_scope == "background"
+            ):
+                prompt_info["prompt"] = background_inpaint_prompt(prompt_info["prompt"])
+                prompt_info["intent_notes"] = (
+                    f"{prompt_info.get('intent_notes', '')} Background-only inpainting: "
+                    "subject-building tags were removed to prevent duplicate characters."
+                ).strip()
             elif background_suppression_requested(prompt, mode):
                 prompt_info = apply_background_suppression(prompt_info, settings)
             _STATE["refiner"].unload_if_cuda()
@@ -1068,63 +1181,45 @@ def api_generate_start():
                     source, plain_background_mask = extract_plain_background_mask(source_path)
                     if scene_mask_path:
                         plain_background_mask = Image.open(scene_mask_path).convert("L").resize(source.size)
-                    use_scene_compositor = (
-                        editor_id == "waifu_inpaint_xl"
-                        and edit_scope == "background"
-                        and mask_path is None
-                        and plain_background_mask is not None
-                    )
-                    if use_scene_compositor:
-                        q.put({
-                            "type": "status",
-                            "phase": "generate",
-                            "message": "人物を保持し、背景用のシーンを生成しています",
-                        })
-                        unload_active_editor()
-                        if _STATE["janku_pipe"] is None:
-                            def model_status(message):
-                                q.put({"type": "status", "phase": "generate", "message": message})
-                            _STATE["janku_pipe"] = load_janku_pipeline(status_callback=model_status)
-                        scene_settings = background_scene_settings(settings, source)
-                        scene_prompt = background_scene_prompt(prompt_info["prompt"])
-                        fitted_prompt = fit_prompt_for_sdxl(_STATE["janku_pipe"], scene_prompt)
-                        prompt_info["prompt"] = fitted_prompt
-                        background = generate_with_janku(
-                            _STATE["janku_pipe"],
-                            fitted_prompt,
-                            scene_settings,
-                            callback=progress,
-                        )
-                        image = composite_foreground_over_scene(source, background, plain_background_mask)
+                    effective_mask_path = mask_path
+                    if edit_scope == "background" and effective_mask_path is None and scene_mask_path:
+                        effective_mask_path = scene_mask_path
+                    reusable_mask = None
+                    if edit_scope == "background":
+                        if effective_mask_path:
+                            reusable_mask = Image.open(effective_mask_path).convert("L").resize(source.size)
+                        else:
+                            reusable_mask = plain_background_mask
+                    if reusable_mask is not None:
                         mask_buffer = io.BytesIO()
-                        plain_background_mask.save(mask_buffer, format="PNG")
+                        reusable_mask.save(mask_buffer, format="PNG")
                         generated_background_mask = base64.b64encode(mask_buffer.getvalue()).decode("ascii")
-                    else:
-                        q.put({
-                            "type": "status",
-                            "phase": "generate",
-                            "message": f"{EDITOR_MODELS[editor_id]['label']} を準備しています",
-                        })
-                        unload_pipeline("janku_pipe")
-                        if _STATE["editor_id"] != editor_id:
-                            unload_active_editor()
-                        if _STATE["editor_pipe"] is None:
-                            def editor_status(message):
-                                q.put({"type": "status", "phase": "generate", "message": message})
-                            _STATE["editor_pipe"] = load_editor_pipeline(editor_id, status_callback=editor_status)
-                            _STATE["editor_id"] = editor_id
-                        image = edit_image(
-                            editor_id,
-                            _STATE["editor_pipe"],
-                            prompt_info["prompt"],
-                            source_path,
-                            mask_path,
-                            settings["seed"],
-                            strength=edit_strength,
-                            callback=progress,
-                            status_callback=lambda message: q.put({"type": "status", "phase": "generate", "message": message}),
-                            edit_scope=edit_scope,
-                        )
+                    q.put({
+                        "type": "status",
+                        "phase": "generate",
+                        "message": f"{EDITOR_MODELS[editor_id]['label']} で元画像になじむように編集しています",
+                    })
+                    unload_pipeline("janku_pipe")
+                    if _STATE["editor_id"] != editor_id:
+                        unload_active_editor()
+                    if _STATE["editor_pipe"] is None:
+                        def editor_status(message):
+                            q.put({"type": "status", "phase": "generate", "message": message})
+                        _STATE["editor_pipe"] = load_editor_pipeline(editor_id, status_callback=editor_status)
+                        _STATE["editor_id"] = editor_id
+                    image = edit_image(
+                        editor_id,
+                        _STATE["editor_pipe"],
+                        prompt_info["prompt"],
+                        settings["negative_prompt"],
+                        source_path,
+                        effective_mask_path,
+                        settings["seed"],
+                        strength=edit_strength,
+                        callback=progress,
+                        status_callback=lambda message: q.put({"type": "status", "phase": "generate", "message": message}),
+                        edit_scope=edit_scope,
+                    )
                 else:
                     q.put({"type": "status", "phase": "generate", "message": f"{IMAGE_MODEL_LABEL}を準備しています"})
                     unload_active_editor()
@@ -1132,13 +1227,16 @@ def api_generate_start():
                         def model_status(message):
                             q.put({"type": "status", "phase": "generate", "message": message})
                         _STATE["janku_pipe"] = load_janku_pipeline(status_callback=model_status)
+                    # Keep the ordered user facts first and reserve room for the
+                    # model's quality suffix. The pipeline still uses 77-token
+                    # CLIP windows even when its long-prompt helper is enabled.
                     fitted_prompt = fit_prompt_for_sdxl(_STATE["janku_pipe"], prompt_info["prompt"])
                     if fitted_prompt != prompt_info["prompt"]:
                         prompt_info["prompt"] = fitted_prompt
                         q.put({
                             "type": "status",
                             "phase": "generate",
-                            "message": "重要な要素を優先し、モデルに収まる長さへプロンプトを最適化しました",
+                            "message": "重要な要素と品質タグを優先し、モデルに収まる長さへ最適化しました",
                         })
                     image = generate_with_janku(
                         _STATE["janku_pipe"],
@@ -1147,7 +1245,8 @@ def api_generate_start():
                         callback=progress,
                     )
                     image = apply_image_style_tone(image, settings)
-                    image = normalize_plain_background(image)
+                    if workflow == WORKFLOW_CHARACTER:
+                        image = normalize_plain_background(image)
 
             buf = io.BytesIO()
             image.save(buf, format="PNG")

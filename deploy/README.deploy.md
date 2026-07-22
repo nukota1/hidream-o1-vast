@@ -45,17 +45,53 @@ the instance must have a read token in `HF_TOKEN`.
 Models are stored under `/models`. Mount a persistent volume there when the Vast
 host supports it; otherwise they are downloaded for every new instance.
 
-## Cloudflare Worker
+## Cloudflare Worker and authentication
 
-`cloudflare-worker/src/index.ts` proxies requests to the current Vast public URL.
-Set `BACKEND_URL` to the URL without its query string. If Vast issues a browser
-URL containing `?token=...`, store only that value in the Worker secret
-`BACKEND_TOKEN`; the Worker adds it to upstream requests without exposing it to
-the browser. Set `ALLOWED_ORIGIN` to the Worker URL or production custom domain.
+The Worker owns the gallery storage API. Generated PNG files are stored in
+Cloudflare R2 and gallery records, folders, and favorite prompt groups are stored
+in D1. Records are scoped by the authenticated Cloudflare Access user ID.
+The Worker proxies image-generation requests to Vast only after Access JWT
+validation and adds a private `X-Backend-Key` header.
 
-R2 access remains in the Vast container through its S3-compatible environment
-variables. The current Worker does not have an R2 or D1 binding.
+Create the resources once from `deploy/cloudflare-worker`:
 
-For a Worker created through the Cloudflare dashboard's single-file editor, copy
-`cloudflare-worker/worker.js` into the dashboard's `worker.js` file instead of
-the TypeScript source file.
+```powershell
+npm install
+npx wrangler r2 bucket create hidream-o1-generated-images
+npx wrangler d1 create janku-image-studio
+```
+
+Copy the returned D1 `database_id` into `wrangler.toml`. Keep `BACKEND_URL` empty
+until the Vast endpoint is known. Apply the schema and deploy:
+
+```powershell
+npx wrangler d1 migrations apply janku-image-studio --remote
+npx wrangler deploy
+```
+
+The R2/D1 bindings are named `GALLERY_BUCKET` and `DB`. Do not put API keys,
+`BACKEND_SHARED_SECRET`, Google OAuth secrets, or Access credentials in
+`wrangler.toml` or GitHub. Once the bindings exist, the Worker runtime does not
+need the Cloudflare API token or the R2 S3 secret.
+
+### Google account login
+
+Configure Cloudflare Access on the Worker before enabling its `workers.dev`
+route. Add Google as an identity provider, create an external Google OAuth
+client, and use an Access Allow policy with `Include: Everyone` plus
+`Require: Login methods -> Google`. This permits any Google account to sign in;
+it does not expose the Worker before authentication. Set the resulting
+`ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` values as Worker variables. The Worker
+fails closed with HTTP 503 until both values are present.
+
+After Access is configured, create a long random `BACKEND_SHARED_SECRET` as a
+Worker secret and set the same value as the Vast `BACKEND_SHARED_SECRET`
+environment variable. The Flask backend rejects direct requests without this
+header. The current project intentionally leaves `BACKEND_URL` empty until the
+Vast URL is provided.
+
+When the UI is opened directly at `127.0.0.1`, it keeps using IndexedDB as a
+development fallback. When opened through the deployed Worker after Access
+login, the UI detects `/api/gallery/health` and automatically uses the
+authenticated user's R2/D1 data. Images are uploaded after each successful
+generation, so the gallery no longer depends on the manual save button.

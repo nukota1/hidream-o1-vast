@@ -32,8 +32,9 @@ fi
 : "${PYTORCH_INDEX_URL:=https://download.pytorch.org/whl/cu128}"
 : "${PYTORCH_VERSION:=2.7.1}"
 : "${TORCHVISION_VERSION:=0.22.1}"
+: "${PROMPT_REFINER_LOCAL_FILES_ONLY:=1}"
 
-export HF_HOME
+export HF_HOME PROMPT_REFINER_LOCAL_FILES_ONLY
 
 pip_install_with_retry() {
   local attempt=1

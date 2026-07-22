@@ -2,13 +2,23 @@ name = "janku-image-studio"
 main = "src/index.ts"
 compatibility_date = "2026-07-01"
 
-[vars]
-# Set this to the public Vast.ai URL that exposes port 7861.
-# Example: "https://your-vast-host.example.com"
-BACKEND_URL = "https://replace-with-vast-backend-url"
-# Use the Worker URL or your production custom domain, not "*".
-ALLOWED_ORIGIN = "https://janku-image-studio.<your-subdomain>.workers.dev"
+[[r2_buckets]]
+binding = "GALLERY_BUCKET"
+bucket_name = "hidream-o1-generated-images"
 
-# Set BACKEND_TOKEN as a Worker secret in the dashboard or with:
-# wrangler secret put BACKEND_TOKEN
-# Never add the token to this file.
+[[d1_databases]]
+binding = "DB"
+database_name = "janku-image-studio"
+database_id = "replace-with-d1-database-id"
+migrations_table = "d1_migrations"
+migrations_dir = "migrations"
+
+[vars]
+# Leave empty until the public Vast.ai URL is known.
+BACKEND_URL = ""
+ALLOWED_ORIGIN = "https://your-worker.example.workers.dev"
+# Required before enabling public access. These values are shown by Access.
+ACCESS_TEAM_DOMAIN = "https://your-team.cloudflareaccess.com"
+ACCESS_AUD = "replace-with-access-application-audience"
+
+# BACKEND_SHARED_SECRET must be stored as a Worker secret, not in this file.

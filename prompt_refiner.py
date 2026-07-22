@@ -93,6 +93,10 @@ Rules:
   facts with generic style words.
 - Never omit a requested camera angle, pose, composition, foreground/background
   relationship, or setting. These are primary image facts, not optional detail.
+- For eye descriptions, use one canonical color tag such as `red eyes`, followed
+  by `gradient eyes, eye highlights`. Do not use glassy eyes, glossy eyes,
+  transparent eyes, refraction, catchlight, or multiple-highlight prose; those
+  effects often corrupt the iris in full-body Animagine images.
 - You may use up to 48 short tags. Keep the requested tag order intact: subject
   and composition first, then appearance/clothing/props, then setting/weather.
 - If the user explicitly requests no background, a blank background, or a white
@@ -133,12 +137,20 @@ class LocalPromptRefiner:
 
         from transformers import AutoModelForCausalLM, AutoProcessor
 
-        print(f"[refine] Loading local prompt refiner: {self.model_id}")
-        self.processor = AutoProcessor.from_pretrained(self.model_id, trust_remote_code=True)
+        local_files_only = os.environ.get(
+            "PROMPT_REFINER_LOCAL_FILES_ONLY", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        load_kwargs = {
+            "trust_remote_code": True,
+            "local_files_only": local_files_only,
+        }
+        source = "local cache" if local_files_only else "Hugging Face"
+        print(f"[refine] Loading prompt refiner from {source}: {self.model_id}")
+        self.processor = AutoProcessor.from_pretrained(self.model_id, **load_kwargs)
         device = os.environ.get("PROMPT_REFINER_DEVICE", "cuda").lower()
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
-        model_kwargs = {"dtype": "auto", "trust_remote_code": True}
+        model_kwargs = {"dtype": "auto", **load_kwargs}
         if device == "cpu":
             model_kwargs["device_map"] = {"": "cpu"}
         elif device in {"cuda", "gpu"}:
@@ -395,8 +407,9 @@ class LocalPromptRefiner:
     def _workflow_constraint(workflow):
         if workflow == "character":
             return (
-                "Character-generation workflow: return one single full-body standing "
-                "character on a simple plain white background. Exclude scenery, rooms, "
+                "Character-generation workflow: return one single character on a simple "
+                "plain white background. Follow the user's requested pose, camera angle, "
+                "crop, and framing exactly; never force standing or full body. Exclude scenery, rooms, "
                 "weather, horizons, buildings, and environmental effects even when the "
                 "user describes a future scene. Preserve character appearance, outfit, "
                 "accessories, and expression exactly."
@@ -406,6 +419,27 @@ class LocalPromptRefiner:
                 "Background-composition workflow: describe only the requested background, "
                 "pose, camera, and scene changes. Preserve the existing character identity, "
                 "face, hairstyle, outfit, and all unrequested details."
+            )
+        if workflow == "compose_background":
+            return (
+                "Masked background-inpainting workflow: output only environment, scenery, "
+                "weather, perspective, lighting, and ground-contact tags. The existing subject "
+                "is outside the editable mask. Do not output girl, boy, person, face, body, pose, "
+                "outfit, hair, or any tag that could create another character. Never add people."
+            )
+        if workflow == "event_cg":
+            return (
+                "Integrated event-CG workflow: combine the supplied character design with the "
+                "requested pose, camera, background, weather, lighting, and interaction into one "
+                "coherent image. Preserve every concrete character trait and every requested scene "
+                "fact. Use exactly one main character unless the user explicitly requests more."
+            )
+        if workflow == "event_scene":
+            return (
+                "Locked-character event-CG workflow: output only the requested pose, camera, "
+                "background, weather, lighting, interaction, and scene tags. Character identity, "
+                "face, hair, body design, outfit, footwear, accessories, and colors are supplied "
+                "separately and must not be restated, replaced, or invented."
             )
         return "No additional workflow constraint."
 

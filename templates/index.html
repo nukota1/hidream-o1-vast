@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ app_name }}</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='app.css', v='20260715-catalog5') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css', v='20260716-cloud1') }}">
 </head>
 <body>
   <header class="topbar">
@@ -15,13 +15,18 @@
   <nav class="workflow-tabs" aria-label="制作工程">
     <button id="tab-character" class="workflow-tab" type="button" data-workflow="character" aria-pressed="true">キャラクター生成</button>
     <button id="tab-compose" class="workflow-tab" type="button" data-workflow="compose" aria-pressed="false">背景合成 / 修正</button>
+    <button id="tab-gallery" class="workflow-tab" type="button" data-workflow="gallery" aria-pressed="false">ギャラリー</button>
+    <button id="tab-settings" class="workflow-tab" type="button" data-workflow="settings" aria-pressed="false">ユーザー設定</button>
   </nav>
 
   <div class="workspace">
     <aside class="controls">
       <section id="panel-character" class="workflow-panel">
         <div class="field">
-          <label for="character-prompt">キャラクターの要素</label>
+          <div class="field-heading">
+            <label for="character-prompt">キャラクターの要素</label>
+            <button id="character-history-open" class="compact-command" type="button">プロンプトを履歴から参照</button>
+          </div>
           <textarea id="character-prompt" rows="6" placeholder="容姿、髪型、服装、表情、アクセサリーなどを入力"></textarea>
         </div>
 
@@ -32,7 +37,14 @@
             <select id="character-catalog-subcategory" aria-label="キャラクター用カタログの中分類" disabled></select>
             <input id="character-catalog-query" type="search" placeholder="カタログを検索">
           </div>
-          <div id="character-selected" class="selected-prompts" aria-live="polite"></div>
+          <div class="catalog-actions">
+            <button id="character-favorite-import" type="button" hidden>お気に入りを一括追加</button>
+            <button id="character-catalog-reset" type="button">選択をすべて解除</button>
+          </div>
+          <div class="selected-box">
+            <div id="character-selected-tabs" class="selected-tabs" role="tablist" aria-label="選択済み項目の分類"></div>
+            <div id="character-selected" class="selected-prompts" aria-live="polite"></div>
+          </div>
           <div id="character-catalog-results" class="catalog-results" aria-live="polite"></div>
           <button id="character-catalog-more" class="catalog-more" type="button" hidden>さらに読み込む</button>
         </section>
@@ -115,7 +127,7 @@
           </div>
         </details>
 
-        <button id="generate-character" class="primary-command" type="button">立ち絵を生成</button>
+        <button id="generate-character" class="primary-command" type="button">キャラクターを生成</button>
       </section>
 
       <section id="panel-compose" class="workflow-panel" hidden>
@@ -131,7 +143,10 @@
         </div>
 
         <div class="field">
-          <label for="compose-prompt">背景・構図・修正内容</label>
+          <div class="field-heading">
+            <label for="compose-prompt">背景・構図・修正内容</label>
+            <button id="compose-history-open" class="compact-command" type="button">プロンプトを履歴から参照</button>
+          </div>
           <textarea id="compose-prompt" rows="6" placeholder="背景、ポーズ、カメラ、表情など、今回変更したい内容を入力"></textarea>
         </div>
 
@@ -142,7 +157,14 @@
             <select id="compose-catalog-subcategory" aria-label="背景合成用カタログの中分類" disabled></select>
             <input id="compose-catalog-query" type="search" placeholder="カタログを検索">
           </div>
-          <div id="compose-selected" class="selected-prompts" aria-live="polite"></div>
+          <div class="catalog-actions">
+            <button id="compose-favorite-import" type="button" hidden>お気に入りを一括追加</button>
+            <button id="compose-catalog-reset" type="button">選択をすべて解除</button>
+          </div>
+          <div class="selected-box">
+            <div id="compose-selected-tabs" class="selected-tabs" role="tablist" aria-label="選択済み項目の分類"></div>
+            <div id="compose-selected" class="selected-prompts" aria-live="polite"></div>
+          </div>
           <div id="compose-catalog-results" class="catalog-results" aria-live="polite"></div>
           <button id="compose-catalog-more" class="catalog-more" type="button" hidden>さらに読み込む</button>
         </section>
@@ -156,11 +178,29 @@
         </label>
 
         <div class="field">
+          <label for="compose-method">背景の作成方法</label>
+          <select id="compose-method">
+            <option value="integrated" selected>イベントCGとして一枚で再生成（推奨）</option>
+            <option value="inpaint">元キャラクターを保持して背景だけ置換</option>
+          </select>
+          <small>推奨方式ではキャラクター設定と背景・構図を同時に描くため、人物と背景が自然になじみます。</small>
+        </div>
+
+        <label class="toggle-row" id="compose-character-lock" for="compose-lock-character">
+          <span>
+            <strong>キャラクターと衣装を固定</strong>
+            <small>元の容姿・髪・衣装・装飾品を優先し、背景とポーズだけを組み直します</small>
+          </span>
+          <input id="compose-lock-character" type="checkbox" checked>
+        </label>
+
+        <div class="field" id="compose-edit-scope-field">
           <label for="compose-edit-scope">修正範囲</label>
           <select id="compose-edit-scope">
             <option value="background" selected>背景を作成・合成（人物を保持）</option>
             <option value="full">画像全体を修正（ポーズ変更を含む）</option>
           </select>
+          <small>背景のみでは人物の形を保持します。ポーズを変える場合は「画像全体を修正」を選択してください。</small>
         </div>
 
         <div class="field" id="compose-strength-field">
@@ -169,7 +209,7 @@
           <small>低いほど元キャラクターを維持し、高いほど背景・構図を変えます</small>
         </div>
 
-        <details>
+        <details id="compose-mask-settings">
           <summary>編集マスク</summary>
           <div class="field">
             <label for="compose-mask">白い領域を優先して変更</label>
@@ -181,10 +221,76 @@
         <button id="generate-compose" class="primary-command" type="button">背景を合成 / 画像を修正</button>
       </section>
 
+      <section id="panel-settings" class="workflow-panel" hidden>
+        <div>
+          <div class="section-label">お気に入りプロンプト</div>
+          <p class="panel-description">グループを作成し、下のカタログから登録する項目を選択します。</p>
+        </div>
+        <div class="favorite-create-row">
+          <input id="favorite-group-name" type="text" maxlength="80" placeholder="例: お気に入り1">
+          <button id="favorite-group-add" type="button">作成</button>
+        </div>
+        <div class="field">
+          <label for="favorite-group-select">編集するグループ</label>
+          <select id="favorite-group-select"></select>
+        </div>
+        <div class="favorite-group-actions">
+          <button id="favorite-group-rename" type="button">名前を変更</button>
+          <button id="favorite-group-delete" class="danger-command" type="button">削除</button>
+        </div>
+        <div id="favorite-summary" class="favorite-summary"></div>
+
+        <details open>
+          <summary>任意のプロンプトを登録</summary>
+          <div class="custom-prompt-form">
+            <div class="field">
+              <label for="custom-prompt-name">日本語名</label>
+              <input id="custom-prompt-name" type="text" maxlength="120" placeholder="例: 雨上がりの光">
+            </div>
+            <div class="field">
+              <label for="custom-prompt-value">プロンプト</label>
+              <textarea id="custom-prompt-value" rows="3" placeholder="例: soft light after rain, wet reflections"></textarea>
+            </div>
+            <div class="field">
+              <label for="custom-prompt-description">説明</label>
+              <textarea id="custom-prompt-description" rows="2" placeholder="用途や効果のメモ"></textarea>
+            </div>
+            <button id="custom-prompt-add" type="button">編集中のグループへ登録</button>
+          </div>
+        </details>
+
+        <section class="catalog-panel" aria-labelledby="settings-catalog-title">
+          <div class="section-label" id="settings-catalog-title">登録するプロンプトを選択</div>
+          <div class="catalog-toolbar">
+            <select id="settings-catalog-category" aria-label="お気に入り用カタログのカテゴリ"></select>
+            <select id="settings-catalog-subcategory" aria-label="お気に入り用カタログの中分類" disabled></select>
+            <input id="settings-catalog-query" type="search" placeholder="カタログを検索">
+          </div>
+          <div id="settings-catalog-results" class="catalog-results" aria-live="polite"></div>
+          <button id="settings-catalog-more" class="catalog-more" type="button" hidden>さらに読み込む</button>
+        </section>
+      </section>
+
+      <section id="panel-gallery" class="workflow-panel" hidden>
+        <div>
+          <div class="section-label">フォルダ</div>
+          <p class="panel-description">画像は最初に「トップ」へ保存されます。</p>
+        </div>
+        <div class="favorite-create-row">
+          <input id="gallery-folder-name" type="text" maxlength="80" placeholder="新しいフォルダ名">
+          <button id="gallery-folder-add" type="button">追加</button>
+        </div>
+        <div id="gallery-folders" class="folder-list"></div>
+        <div class="favorite-group-actions">
+          <button id="gallery-folder-rename" type="button">名前を変更</button>
+          <button id="gallery-folder-delete" class="danger-command" type="button">削除</button>
+        </div>
+      </section>
+
       <div id="error" class="error" hidden></div>
     </aside>
 
-    <main class="result-area">
+    <main id="result-area" class="result-area">
       <div id="empty" class="empty-state">
         <div class="empty-mark">A</div>
         <p>生成した画像がここに表示されます</p>
@@ -212,9 +318,60 @@
         </details>
       </section>
     </main>
+
+    <main id="gallery-area" class="gallery-area" hidden>
+      <div class="gallery-heading">
+        <div>
+          <h1 id="gallery-title">トップ</h1>
+          <p id="gallery-count">0件</p>
+        </div>
+        <div class="gallery-hint">画像を長押し、右クリック、またはメニューボタンで移動</div>
+      </div>
+      <div id="gallery-grid" class="gallery-grid"></div>
+    </main>
   </div>
 
+  <dialog id="history-dialog" class="history-dialog">
+    <div class="dialog-heading">
+      <div>
+        <strong>以前の画像からプロンプトを参照</strong>
+        <p>画像を選ぶと、その生成時に使用したプロンプトを入力欄へ反映します。</p>
+      </div>
+      <button id="history-close" class="dialog-close" type="button" aria-label="閉じる">×</button>
+    </div>
+    <div id="history-grid" class="history-grid"></div>
+  </dialog>
+
+  <dialog id="gallery-preview-dialog" class="history-dialog gallery-preview-dialog">
+    <div class="dialog-heading">
+      <div>
+        <strong id="gallery-preview-title">生成画像</strong>
+        <p id="gallery-preview-meta"></p>
+      </div>
+      <button id="gallery-preview-close" class="dialog-close" type="button" aria-label="閉じる">×</button>
+    </div>
+    <div class="gallery-preview-body">
+      <img id="gallery-preview-image" alt="拡大した生成画像">
+      <pre id="gallery-preview-prompt"></pre>
+    </div>
+  </dialog>
+
+  <dialog id="gallery-move-dialog" class="move-dialog">
+    <div class="dialog-heading">
+      <div>
+        <strong>画像を移動</strong>
+        <p>移動先のフォルダを選択します。</p>
+      </div>
+      <button id="gallery-move-close" class="dialog-close" type="button" aria-label="閉じる">×</button>
+    </div>
+    <div class="move-dialog-body">
+      <label for="gallery-move-target">移動先</label>
+      <select id="gallery-move-target"></select>
+      <button id="gallery-move-confirm" class="primary-command" type="button">ここへ移動</button>
+    </div>
+  </dialog>
+
   <script id="preset-data" type="application/json">{{ presets_json|safe }}</script>
-  <script src="{{ url_for('static', filename='app.js', v='20260715-catalog5') }}"></script>
+  <script src="{{ url_for('static', filename='app.js', v='20260716-cloud1') }}"></script>
 </body>
 </html>

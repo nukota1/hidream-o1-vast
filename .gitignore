@@ -53,6 +53,7 @@ ipython_config.py
 # Environments
 .env
 .env.*
+deploy/cloudflare-worker/wrangler.toml
 .venv
 env/
 venv/
