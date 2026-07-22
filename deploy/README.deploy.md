@@ -55,3 +55,7 @@ the browser. Set `ALLOWED_ORIGIN` to the Worker URL or production custom domain.
 
 R2 access remains in the Vast container through its S3-compatible environment
 variables. The current Worker does not have an R2 or D1 binding.
+
+For a Worker created through the Cloudflare dashboard's single-file editor, copy
+`cloudflare-worker/worker.js` into the dashboard's `worker.js` file instead of
+the TypeScript source file.
