@@ -6,4 +6,9 @@ compatibility_date = "2026-07-01"
 # Set this to the public Vast.ai URL that exposes port 7861.
 # Example: "https://your-vast-host.example.com"
 BACKEND_URL = "https://replace-with-vast-backend-url"
-ALLOWED_ORIGIN = "*"
+# Use the Worker URL or your production custom domain, not "*".
+ALLOWED_ORIGIN = "https://janku-image-studio.<your-subdomain>.workers.dev"
+
+# Set BACKEND_TOKEN as a Worker secret in the dashboard or with:
+# wrangler secret put BACKEND_TOKEN
+# Never add the token to this file.

@@ -48,5 +48,10 @@ host supports it; otherwise they are downloaded for every new instance.
 ## Cloudflare Worker
 
 `cloudflare-worker/src/index.ts` proxies requests to the current Vast public URL.
-Set `BACKEND_URL` in Wrangler and deploy the Worker. User authentication and rate
-limiting are not implemented yet.
+Set `BACKEND_URL` to the URL without its query string. If Vast issues a browser
+URL containing `?token=...`, store only that value in the Worker secret
+`BACKEND_TOKEN`; the Worker adds it to upstream requests without exposing it to
+the browser. Set `ALLOWED_ORIGIN` to the Worker URL or production custom domain.
+
+R2 access remains in the Vast container through its S3-compatible environment
+variables. The current Worker does not have an R2 or D1 binding.

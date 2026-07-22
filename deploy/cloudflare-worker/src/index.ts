@@ -1,5 +1,6 @@
 export interface Env {
   BACKEND_URL: string;
+  BACKEND_TOKEN?: string;
   ALLOWED_ORIGIN?: string;
 }
 
@@ -25,6 +26,11 @@ export default {
     const upstream = new URL(env.BACKEND_URL);
     upstream.pathname = incoming.pathname;
     upstream.search = incoming.search;
+    // Vast browser URLs may require a per-instance query token. Keep it only
+    // in a Worker secret so it is never sent to the browser or committed.
+    if (env.BACKEND_TOKEN) {
+      upstream.searchParams.set("token", env.BACKEND_TOKEN);
+    }
 
     const headers = new Headers(request.headers);
     headers.delete("host");
