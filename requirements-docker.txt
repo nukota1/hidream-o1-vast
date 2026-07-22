@@ -9,6 +9,7 @@ scipy
 flask
 python-dotenv
 huggingface_hub
+kernels
 boto3
 peft
 safetensors

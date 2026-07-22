@@ -147,6 +147,16 @@ class LocalPromptRefiner:
             device = "cuda"
         else:
             model_kwargs["device_map"] = "auto"
+        # Qwen3.5's DeltaNet layers are prohibitively slow with the pure
+        # PyTorch fallback. The optional `kernels` package selects a compatible
+        # Hub kernel on recent NVIDIA GPUs and safely falls back otherwise.
+        if os.environ.get("PROMPT_REFINER_USE_KERNELS", "1").lower() not in {"0", "false", "no", "off"}:
+            try:
+                import kernels  # noqa: F401
+            except ImportError:
+                print("[refine] Optional Qwen kernels package is unavailable; using the PyTorch fallback.")
+            else:
+                model_kwargs["use_kernels"] = True
         self.model = AutoModelForCausalLM.from_pretrained(self.model_id, **model_kwargs).eval()
         self.device = device
 
@@ -364,13 +374,22 @@ class LocalPromptRefiner:
         target_device = getattr(self.model, "device", torch.device("cpu"))
         inputs = {name: value.to(target_device) for name, value in inputs.items()}
         input_len = inputs["input_ids"].shape[-1]
+        max_time = float(os.environ.get("PROMPT_REFINER_MAX_TIME", "90"))
+        print(
+            f"[refine] Generating optimized prompt "
+            f"({input_len} input tokens, up to {max_new_tokens} output tokens)."
+        )
         with torch.inference_mode():
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
+                use_cache=True,
+                max_time=max_time if max_time > 0 else None,
             )
-        return self.processor.decode(outputs[0][input_len:], skip_special_tokens=True)
+        result = self.processor.decode(outputs[0][input_len:], skip_special_tokens=True)
+        print(f"[refine] Prompt generation finished ({len(result)} characters).")
+        return result
 
     @staticmethod
     def _workflow_constraint(workflow):
@@ -414,7 +433,7 @@ class LocalPromptRefiner:
                 ),
             },
         ]
-        max_new_tokens = int(os.environ.get("PROMPT_REFINER_MAX_NEW_TOKENS", "220"))
+        max_new_tokens = int(os.environ.get("PROMPT_REFINER_MAX_NEW_TOKENS", "96"))
         raw = self._generate(messages, max_new_tokens)
         try:
             result = self._parse_json(raw)
