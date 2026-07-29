@@ -102,6 +102,10 @@ Rules:
 - If the user explicitly requests no background, a blank background, or a white
   background, use `simple white background, plain background, isolated` and do
   not add scenery, rooms, landscapes, sky, buildings, or other setting tags.
+- In the standalone character-asset workflow, use `simple white background,
+  plain background, isolated`. Do not use chroma-key backgrounds.
+- In the story-illustration workflow, do not add a plain background. Keep the
+  character facts separate from the scene facts supplied by the application.
 - End text-to-image prompts with exactly: `masterpiece, high score, great score, absurdres`.
 - Japanese clothing glossary: `ワンピース` and `ロングワンピース` mean `dress`
   and `long dress`, never `swimsuit` unless the user explicitly says `水着`.
@@ -159,10 +163,10 @@ class LocalPromptRefiner:
             device = "cuda"
         else:
             model_kwargs["device_map"] = "auto"
-        # Qwen3.5's DeltaNet layers are prohibitively slow with the pure
-        # PyTorch fallback. The optional `kernels` package selects a compatible
-        # Hub kernel on recent NVIDIA GPUs and safely falls back otherwise.
-        if os.environ.get("PROMPT_REFINER_USE_KERNELS", "1").lower() not in {"0", "false", "no", "off"}:
+        # Optional Hub kernels are disabled by default because their published
+        # activation builds currently require a newer Torch stable ABI than
+        # this CUDA runtime. The standard PyTorch path is slower but reliable.
+        if os.environ.get("PROMPT_REFINER_USE_KERNELS", "0").lower() not in {"0", "false", "no", "off"}:
             try:
                 import kernels  # noqa: F401
             except ImportError:
@@ -407,12 +411,25 @@ class LocalPromptRefiner:
     def _workflow_constraint(workflow):
         if workflow == "character":
             return (
-                "Character-generation workflow: return one single character on a simple "
-                "plain white background. Follow the user's requested pose, camera angle, "
-                "crop, and framing exactly; never force standing or full body. Exclude scenery, rooms, "
-                "weather, horizons, buildings, and environmental effects even when the "
-                "user describes a future scene. Preserve character appearance, outfit, "
-                "accessories, and expression exactly."
+                "Standalone character-asset workflow: return one single character on a "
+                "simple white background. Follow the user's requested pose, camera angle, "
+                "crop, and framing exactly; never force standing or full body. Exclude "
+                "scenery, rooms, weather, horizons, buildings, and environmental effects. "
+                "Preserve character appearance, outfit, accessories, and expression exactly."
+            )
+        if workflow == "story_character":
+            return (
+                "Story-illustration character pass: output only the main character's identity, "
+                "appearance, body design, outfit, accessories, expression, pose, framing, and "
+                "camera-facing direction. Do not add any background, scenery, weather, location, "
+                "or plain-background tags. Preserve every concrete user-specified character fact."
+            )
+        if workflow == "story_scene":
+            return (
+                "Story-illustration scene pass: output only location, background, time, weather, "
+                "lighting, atmosphere, camera composition, interaction, and requested pose or "
+                "expression changes. Do not invent or replace character identity, hair, eyes, "
+                "body design, outfit, footwear, accessories, or colors."
             )
         if workflow == "compose":
             return (

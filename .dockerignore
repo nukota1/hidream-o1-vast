@@ -1,5 +1,6 @@
 models-cache/
 outputs/
+input/
 __pycache__/
 .git/
 .env

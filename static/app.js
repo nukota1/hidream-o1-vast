@@ -25,12 +25,15 @@ const FOLDERS_STORE = "gallery-folders";
 let activeWorkflow = "character";
 let composeSourceImage = "";
 let composeSourceLabel = "";
-let compositionForegroundImage = "";
-let compositionBackgroundMask = "";
 let currentImage = "";
 let currentMetadata = {};
 let rootPrompt = "";
 let rootOptimizedPrompt = "";
+let rootCharacterPrompt = "";
+let rootOptimizedCharacterPrompt = "";
+let rootScenePrompt = "";
+let rootOptimizedScenePrompt = "";
+let rootLoraMetadata = {};
 let editInstructions = [];
 let historyTargetWorkflow = "character";
 let favoriteGroups = [];
@@ -41,6 +44,13 @@ let activeGalleryFolderId = "";
 let movingGalleryRecordId = "";
 let galleryBackend = "local";
 let currentGalleryRecordId = "";
+let galleryContextRecordId = "";
+let loraModels = [];
+let currentLoraModelType = "";
+let loraImageLimits = {character: 100, style: 150, pose: 100, background: 150};
+let loraRecommendedCounts = {character: 10, style: 50, pose: 20, background: 30};
+let loraTrainingSelectedIds = new Set();
+let loraTrainingUploads = [];
 
 function setError(message = "") {
   $("error").textContent = message;
@@ -141,6 +151,113 @@ function galleryImageSource(record) {
   return "";
 }
 
+async function backendRequest(path, options = {}) {
+  const response = await fetch(path, {
+    ...options,
+    headers: {"Content-Type": "application/json", ...(options.headers || {})},
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || "サーバー処理に失敗しました。");
+  return data;
+}
+
+function syncLoraPickers(preferredId = "") {
+  const preferredModel = loraModels.find((model) => model.id === preferredId);
+  ["character", "compose"].forEach((workflow) => {
+    [["character", `${workflow}-lora-select`], ["style", `${workflow}-style-lora-select`]]
+      .forEach(([category, selectId]) => {
+        const select = $(selectId);
+        const previous = preferredModel?.category === category ? preferredId : select.value;
+        select.replaceChildren(new Option("使用しない", ""));
+        loraModels
+          .filter((model) => (
+            model.status === "ready"
+            && model.category === category
+            && (model.compatible ?? model.model_type === currentLoraModelType)
+          ))
+          .forEach((model) => {
+            select.add(new Option(`${model.name}（${model.trigger_word}）`, model.id));
+          });
+        select.value = [...select.options].some((option) => option.value === previous) ? previous : "";
+      });
+  });
+  const training = loraModels.filter((model) => model.status === "training" || model.status === "queued").length;
+  const failed = loraModels.filter((model) => model.status === "failed").length;
+  const incompatible = loraModels.filter((model) => model.status === "ready" && model.compatible === false).length;
+  $("character-lora-help").textContent = training
+    ? `${training}件のLoRAを学習中です。生成処理とは順番に実行されます。`
+    : failed
+      ? `使用可能 ${loraModels.filter((model) => model.status === "ready").length}件 / 失敗 ${failed}件`
+      : incompatible
+        ? `${incompatible}件の旧基盤モデル用LoRAは互換性保護のため非表示です。`
+        : "ギャラリー画像のメニューから追加学習できます。";
+}
+
+async function loadLoraModels(preferredId = "") {
+  const data = await backendRequest("/api/lora/models");
+  loraModels = data.items || [];
+  currentLoraModelType = data.current_model_type || "";
+  loraImageLimits = {...loraImageLimits, ...(data.max_image_counts || {})};
+  loraRecommendedCounts = {...loraRecommendedCounts, ...(data.recommended_image_counts || {})};
+  const modelLabel = data.current_model_label || currentLoraModelType;
+  $("lora-model-type").replaceChildren(new Option(modelLabel, currentLoraModelType));
+  syncLoraPickers(preferredId);
+  syncLoraTrainingCategory();
+}
+
+function loraGenerationSettings(workflow) {
+  const characterId = $(`${workflow}-lora-select`).value;
+  const styleId = $(`${workflow}-style-lora-select`).value;
+  return {
+    ...(characterId ? {
+      character_lora_id: characterId,
+      character_lora_weight: Number($(`${workflow}-lora-weight`).value) / 100,
+    } : {}),
+    ...(styleId ? {
+      style_lora_id: styleId,
+      style_lora_weight: Number($(`${workflow}-style-lora-weight`).value) / 100,
+    } : {}),
+  };
+}
+
+function loraMetadataFromResult(data) {
+  const characterId = data.character_lora_id || data.lora_id || "";
+  return {
+    character_lora_id: characterId,
+    character_lora_name: data.character_lora_name || data.lora_name || "",
+    character_lora_trigger_word: data.character_lora_trigger_word || data.lora_trigger_word || "",
+    character_lora_weight: data.character_lora_weight ?? data.lora_weight ?? null,
+    style_lora_id: data.style_lora_id || "",
+    style_lora_name: data.style_lora_name || "",
+    style_lora_trigger_word: data.style_lora_trigger_word || "",
+    style_lora_weight: data.style_lora_weight ?? null,
+  };
+}
+
+function applyLoraMetadataToWorkflow(metadata, workflow) {
+  const characterId = metadata.character_lora_id || metadata.lora_id || "";
+  if (characterId && [...$(`${workflow}-lora-select`).options].some(
+    (option) => option.value === characterId
+  )) {
+    $(`${workflow}-lora-select`).value = characterId;
+    const weight = metadata.character_lora_weight ?? metadata.lora_weight;
+    if (weight != null) {
+      $(`${workflow}-lora-weight`).value = Math.round(Number(weight) * 100);
+      $(`${workflow}-lora-weight-value`).value = $(`${workflow}-lora-weight`).value;
+    }
+  }
+  const styleId = metadata.style_lora_id || "";
+  if (styleId && [...$(`${workflow}-style-lora-select`).options].some(
+    (option) => option.value === styleId
+  )) {
+    $(`${workflow}-style-lora-select`).value = styleId;
+    if (metadata.style_lora_weight != null) {
+      $(`${workflow}-style-lora-weight`).value = Math.round(Number(metadata.style_lora_weight) * 100);
+      $(`${workflow}-style-lora-weight-value`).value = $(`${workflow}-style-lora-weight`).value;
+    }
+  }
+}
+
 async function persistFavoriteGroup(group) {
   if (galleryBackend === "cloud") {
     await cloudRequest(`/api/favorites/${encodeURIComponent(group.id)}`, {
@@ -218,17 +335,22 @@ function setWorkflow(workflow) {
   $("gallery-area").hidden = workflow !== "gallery";
   if (workflow === "compose" && currentImages.character && !composeSourceImage) {
     setComposeSource(currentImages.character, "キャラクター生成の結果");
+    $("compose-character-definition").value = rootCharacterPrompt || rootOptimizedCharacterPrompt;
   }
   if (workflow === "settings") renderFavoriteSettings();
   if (workflow === "gallery") loadGallery();
 }
 
-function promptForWorkflow(workflow) {
+function promptPartsForWorkflow(workflow) {
   const freeText = $(promptId(workflow)).value.trim();
   const catalogPrompt = selectedCatalog[workflow].map((item) => item.prompt).join(", ");
   // Free text expresses the user's exact intent, so it must reach Qwen and
   // CLIP before the optional catalog tags when the prompt needs compacting.
-  return [freeText, catalogPrompt].filter(Boolean).join("\n");
+  return {
+    freeText,
+    catalogPrompt,
+    prompt: [freeText, catalogPrompt].filter(Boolean).join("\n"),
+  };
 }
 
 function selectedGroupName(item) {
@@ -564,14 +686,38 @@ async function savePromptHistory(data, prompt) {
     folderId: "",
     metadata: {
       original_prompt: data.original_prompt || prompt,
+      free_prompt: data.free_prompt || "",
+      catalog_prompt: data.catalog_prompt || "",
       optimized_prompt: data.optimized_prompt || "",
       optimizer_source: data.optimizer_source || "",
       intent_notes: data.intent_notes || "",
       generation_settings: data.settings || {},
+      image_model_profile: data.image_model_profile || "",
+      image_model_label: data.image_model_label || "",
       workflow: data.workflow || "",
       editor_model: data.editor_model || "",
       edit_strength: data.edit_strength ?? null,
       edit_scope: data.edit_scope || "",
+      lora_id: data.lora_id || "",
+      lora_name: data.lora_name || "",
+      lora_trigger_word: data.lora_trigger_word || "",
+      lora_weight: data.lora_weight ?? null,
+      character_lora_id: data.character_lora_id || data.lora_id || "",
+      character_lora_name: data.character_lora_name || data.lora_name || "",
+      character_lora_trigger_word: data.character_lora_trigger_word || data.lora_trigger_word || "",
+      character_lora_weight: data.character_lora_weight ?? data.lora_weight ?? null,
+      style_lora_id: data.style_lora_id || "",
+      style_lora_name: data.style_lora_name || "",
+      style_lora_trigger_word: data.style_lora_trigger_word || "",
+      style_lora_weight: data.style_lora_weight ?? null,
+      applied_loras: data.applied_loras || [],
+      generation_intent: data.generation_intent || "",
+      character_prompt: data.character_prompt || "",
+      scene_prompt: data.scene_prompt || "",
+      optimized_character_prompt: data.optimized_character_prompt || "",
+      optimized_scene_prompt: data.optimized_scene_prompt || "",
+      reference_used: Boolean(data.reference_used),
+      reference_strength: data.reference_strength ?? null,
     },
   };
   currentGalleryRecordId = record.id;
@@ -607,7 +753,7 @@ async function openPromptHistory(workflow) {
       card.type = "button";
       const image = document.createElement("img");
       image.src = galleryImageSource(record);
-      image.alt = record.workflow === "character" ? "キャラクター生成履歴" : "背景合成履歴";
+      image.alt = record.workflow === "character" ? "キャラクター生成履歴" : "一貫再生成履歴";
       const copy = createElement("div");
       copy.append(
         createElement("strong", "", `${record.workflow === "character" ? "キャラクター" : "背景・修正"} / ${new Date(record.createdAt).toLocaleString("ja-JP")}`),
@@ -675,14 +821,61 @@ function galleryFolderName(folderId) {
 }
 
 function openGalleryPreview(record) {
+  currentGalleryRecordId = record.id;
   $("gallery-preview-image").src = galleryImageSource(record);
-  $("gallery-preview-title").textContent = record.workflow === "character" ? "キャラクター生成" : "背景合成 / 修正";
+  $("gallery-preview-title").textContent = record.workflow === "character" ? "キャラクター生成" : "一貫再生成 / 修正";
   $("gallery-preview-meta").textContent = `${new Date(record.createdAt).toLocaleString("ja-JP")} / ${galleryFolderName(galleryRecordFolder(record))}`;
   $("gallery-preview-prompt").textContent = record.prompt || record.optimizedPrompt || "";
   $("gallery-preview-dialog").showModal();
 }
 
+function closeGalleryContextMenu() {
+  $("gallery-context-menu").hidden = true;
+  galleryContextRecordId = "";
+}
+
+function openGalleryContextMenu(record, clientX, clientY) {
+  galleryContextRecordId = record.id;
+  const menu = $("gallery-context-menu");
+  menu.hidden = false;
+  const width = 250;
+  const height = 132;
+  menu.style.left = `${Math.max(8, Math.min(clientX, window.innerWidth - width - 8))}px`;
+  menu.style.top = `${Math.max(8, Math.min(clientY, window.innerHeight - height - 8))}px`;
+}
+
+async function useGalleryRecordForRegeneration(record) {
+  if (!record) return;
+  closeGalleryContextMenu();
+  if ($("gallery-preview-dialog").open) $("gallery-preview-dialog").close();
+  try {
+    const trainingImage = await galleryRecordAsTrainingImage(record);
+    const image = trainingImage.image.slice(trainingImage.image.indexOf(",") + 1);
+    const metadata = record.metadata || {};
+    const characterPrompt = metadata.character_prompt
+      || metadata.original_character_prompt
+      || metadata.optimized_character_prompt
+      || record.prompt
+      || "";
+    setComposeSource(image, "ギャラリーの参照画像");
+    rootCharacterPrompt = metadata.character_prompt || characterPrompt;
+    rootOptimizedCharacterPrompt = metadata.optimized_character_prompt || characterPrompt;
+    rootScenePrompt = metadata.scene_prompt || "";
+    rootOptimizedScenePrompt = metadata.optimized_scene_prompt || rootScenePrompt;
+    rootPrompt = metadata.original_prompt || record.prompt || characterPrompt;
+    rootOptimizedPrompt = metadata.optimized_prompt || record.optimizedPrompt || characterPrompt;
+    $("compose-character-definition").value = rootCharacterPrompt || rootOptimizedCharacterPrompt;
+    $("compose-method").value = "regenerate";
+    applyLoraMetadataToWorkflow(metadata, "compose");
+    syncComposeEditControls();
+    setWorkflow("compose");
+  } catch (error) {
+    setError(`参照画像を読み込めませんでした: ${error.message}`);
+  }
+}
+
 function openGalleryMove(record) {
+  closeGalleryContextMenu();
   movingGalleryRecordId = record.id;
   const target = $("gallery-move-target");
   target.replaceChildren(new Option("トップ", ""));
@@ -710,7 +903,7 @@ function renderGallery() {
     thumbnail.type = "button";
     const image = document.createElement("img");
     image.src = galleryImageSource(record);
-    image.alt = record.workflow === "character" ? "生成したキャラクター" : "生成した背景合成画像";
+    image.alt = record.workflow === "character" ? "生成したキャラクター" : "一貫再生成画像";
     thumbnail.append(image);
     let longPressTimer = null;
     let longPressed = false;
@@ -718,7 +911,8 @@ function renderGallery() {
       longPressed = false;
       longPressTimer = window.setTimeout(() => {
         longPressed = true;
-        openGalleryMove(record);
+        const bounds = thumbnail.getBoundingClientRect();
+        openGalleryContextMenu(record, bounds.left + 16, bounds.top + 16);
       }, 650);
     });
     ["pointerup", "pointercancel", "pointerleave"].forEach((eventName) => {
@@ -734,18 +928,21 @@ function renderGallery() {
     thumbnail.addEventListener("contextmenu", (event) => {
       event.preventDefault();
       window.clearTimeout(longPressTimer);
-      openGalleryMove(record);
+      openGalleryContextMenu(record, event.clientX, event.clientY);
     });
     const copy = createElement("div", "gallery-card-copy");
     copy.append(
-      createElement("strong", "", record.workflow === "character" ? "キャラクター生成" : "背景合成 / 修正"),
+      createElement("strong", "", record.workflow === "character" ? "キャラクター生成" : "一貫再生成 / 修正"),
       createElement("span", "", new Date(record.createdAt).toLocaleString("ja-JP")),
     );
     const menu = createElement("button", "gallery-card-menu", "⋮");
     menu.type = "button";
-    menu.title = "画像を移動";
-    menu.setAttribute("aria-label", "画像を移動");
-    menu.addEventListener("click", () => openGalleryMove(record));
+    menu.title = "画像メニュー";
+    menu.setAttribute("aria-label", "画像メニュー");
+    menu.addEventListener("click", (event) => {
+      const bounds = event.currentTarget.getBoundingClientRect();
+      openGalleryContextMenu(record, bounds.right - 240, bounds.bottom + 4);
+    });
     card.append(thumbnail, copy, menu);
     container.append(card);
   });
@@ -850,6 +1047,229 @@ async function moveGalleryRecord() {
   renderGallery();
 }
 
+function syncLoraTrainingCategory() {
+  const category = $("lora-category").value;
+  const categoryLabels = {
+    character: "キャラクター",
+    style: "画風",
+    pose: "ポーズ",
+    background: "背景",
+  };
+  const descriptions = {
+    character: "同じ人物の角度・表情・ポーズ・衣装が異なる画像を使い、画風は別LoRAへ分離します。",
+    style: "同じ画風で、人物・髪・衣装・背景・構図が異なる画像を使います。同一人物だけのデータは避けます。",
+    pose: "異なる人物で同じ骨格・ポーズを示す画像を使用します。",
+    background: "人物を固定せず、同じ背景表現を多様な構図・時間帯で用意します。",
+  };
+  const recommended = loraRecommendedCounts[category] || 10;
+  const maximum = loraImageLimits[category] || 30;
+  $("lora-training-title").textContent = `${categoryLabels[category]}LoRAを追加学習`;
+  $("lora-training-description").textContent = `${descriptions[category]} ${recommended}枚以上を推奨します。`;
+  $("lora-upload-help").textContent = `${categoryLabels[category]}LoRAは最大${maximum}枚まで選択できます。`;
+  $("lora-identity-field").hidden = category !== "character";
+  $("lora-identity-negative-field").hidden = category !== "character";
+  if (category !== "character") {
+    $("lora-identity-prompt").value = "";
+    $("lora-identity-negative-prompt").value = "";
+  }
+  updateLoraTrainingQuality();
+}
+
+function updateLoraTrainingQuality() {
+  const category = $("lora-category").value;
+  const count = loraTrainingSelectedIds.size + loraTrainingUploads.length;
+  const recommended = loraRecommendedCounts[category] || 10;
+  const maximum = loraImageLimits[category] || 30;
+  const categoryLabel = {
+    character: "Character",
+    style: "Style",
+    pose: "Pose",
+    background: "Background",
+  }[category];
+  const quality = $("lora-training-quality");
+  if (count > maximum) {
+    quality.classList.remove("is-ready");
+    quality.textContent = `${count}枚選択済み。${categoryLabel} LoRAの上限${maximum}枚を超えています。`;
+  } else if (count >= recommended) {
+    quality.classList.add("is-ready");
+    quality.textContent = `${count}枚選択済み。${categoryLabel} LoRAの推奨枚数を満たしています。`;
+  } else {
+    quality.classList.remove("is-ready");
+    quality.textContent = count
+      ? `${count}枚選択済み。学習は開始できますが、${recommended}枚未満は試験品質です。`
+      : `学習画像を1枚以上選択してください。${recommended}枚以上を推奨します。`;
+  }
+}
+
+function renderLoraDataset() {
+  const grid = $("lora-dataset-grid");
+  grid.replaceChildren();
+  const records = [...galleryRecords].sort((a, b) => b.createdAt - a.createdAt);
+  records.forEach((record) => {
+    const label = createElement("label", "lora-dataset-item");
+    const image = document.createElement("img");
+    image.src = galleryImageSource(record);
+    image.alt = "LoRA学習候補";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = loraTrainingSelectedIds.has(record.id);
+    label.classList.toggle("is-selected", checkbox.checked);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) loraTrainingSelectedIds.add(record.id);
+      else loraTrainingSelectedIds.delete(record.id);
+      label.classList.toggle("is-selected", checkbox.checked);
+      updateLoraTrainingQuality();
+    });
+    label.append(image, checkbox);
+    grid.append(label);
+  });
+  loraTrainingUploads.forEach((upload) => {
+    const label = createElement("label", "lora-dataset-item lora-upload-item is-selected");
+    const image = document.createElement("img");
+    image.src = upload.dataUrl;
+    image.alt = upload.name;
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = true;
+    checkbox.addEventListener("change", () => {
+      if (!checkbox.checked) {
+        loraTrainingUploads = loraTrainingUploads.filter((item) => item.id !== upload.id);
+        renderLoraDataset();
+        updateLoraTrainingQuality();
+      }
+    });
+    label.append(image, checkbox);
+    grid.append(label);
+  });
+  if (!records.length && !loraTrainingUploads.length) {
+    grid.append(createElement("div", "history-empty", "ギャラリー画像または端末の画像を追加してください。"));
+  }
+  updateLoraTrainingQuality();
+}
+
+function openLoraTraining(record) {
+  closeGalleryContextMenu();
+  if ($("gallery-preview-dialog").open) $("gallery-preview-dialog").close();
+  loraTrainingSelectedIds = new Set(record ? [record.id] : []);
+  loraTrainingUploads = [];
+  $("lora-name").value = "";
+  $("lora-trigger-word").value = "";
+  $("lora-identity-prompt").value = "";
+  $("lora-identity-negative-prompt").value = "";
+  $("lora-category").value = "character";
+  $("lora-steps").value = "0";
+  $("lora-upload").value = "";
+  $("lora-training-progress").hidden = true;
+  $("lora-training-progress-fill").style.width = "0%";
+  $("lora-training-start").disabled = false;
+  $("lora-training-start").textContent = "追加学習を開始";
+  syncLoraTrainingCategory();
+  renderLoraDataset();
+  if (!$("lora-training-dialog").open) $("lora-training-dialog").showModal();
+}
+
+async function galleryRecordAsTrainingImage(record) {
+  const source = galleryImageSource(record);
+  if (!source) throw new Error("選択画像のデータを取得できません。");
+  let dataUrl = source;
+  if (!source.startsWith("data:")) {
+    const response = await fetch(source);
+    if (!response.ok) throw new Error("ギャラリー画像を学習用に取得できません。");
+    dataUrl = await fileAsDataUrl(await response.blob());
+  }
+  return {
+    image: dataUrl,
+    source_id: record.id,
+    prompt: record.prompt || record.optimizedPrompt || "",
+    caption: record.optimizedPrompt || record.metadata?.optimized_prompt || record.prompt || "",
+  };
+}
+
+async function startLoraTraining() {
+  const name = $("lora-name").value.trim();
+  const triggerWord = $("lora-trigger-word").value.trim();
+  const identityPrompt = $("lora-identity-prompt").value.trim();
+  const identityNegativePrompt = $("lora-identity-negative-prompt").value.trim();
+  const category = $("lora-category").value;
+  const selectedRecords = galleryRecords.filter((record) => loraTrainingSelectedIds.has(record.id));
+  const imageCount = selectedRecords.length + loraTrainingUploads.length;
+  const maximum = loraImageLimits[category] || 30;
+  if (!name) return setError("LoRA名を入力してください。");
+  if (!/^[A-Za-z][A-Za-z0-9_-]{2,63}$/.test(triggerWord)) {
+    return setError("トリガーワードは英字で始まる3〜64文字の英数字、_、-で入力してください。");
+  }
+  if (!imageCount) return setError("学習画像を1枚以上選択してください。");
+  if (imageCount > maximum) return setError(`学習画像は最大${maximum}枚です。`);
+
+  const button = $("lora-training-start");
+  button.disabled = true;
+  button.textContent = "画像を準備中";
+  setError();
+  $("lora-training-progress").hidden = false;
+  $("lora-training-progress-title").textContent = "学習画像を準備中";
+  $("lora-training-progress-message").textContent = `${imageCount}枚を読み込んでいます`;
+  try {
+    const galleryImages = await Promise.all(selectedRecords.map(galleryRecordAsTrainingImage));
+    const uploadImages = loraTrainingUploads.map((upload) => ({
+      image: upload.dataUrl,
+      source_id: upload.id,
+      prompt: "",
+    }));
+    const start = await backendRequest("/api/lora/train/start", {
+      method: "POST",
+      body: JSON.stringify({
+        name,
+        trigger_word: triggerWord,
+        identity_prompt: identityPrompt,
+        identity_negative_prompt: identityNegativePrompt,
+        category,
+        model_type: $("lora-model-type").value,
+        steps: Number($("lora-steps").value),
+        images: [...galleryImages, ...uploadImages],
+      }),
+    });
+    button.textContent = "追加学習中";
+    await loadLoraModels();
+    await new Promise((resolve, reject) => {
+      const stream = new EventSource(`/api/lora/train/stream/${start.job_id}`);
+      stream.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        if (data.type === "status") {
+          $("lora-training-progress-title").textContent = "LoRAを学習中";
+          $("lora-training-progress-message").textContent = data.message || "";
+        } else if (data.type === "progress") {
+          const percent = Math.round((data.step / data.total) * 100);
+          $("lora-training-progress-title").textContent = `LoRAを学習中 ${percent}%`;
+          $("lora-training-progress-message").textContent = `${data.step} / ${data.total} steps`;
+          $("lora-training-progress-fill").style.width = `${percent}%`;
+        } else if (data.type === "done") {
+          stream.close();
+          resolve(data.model);
+        } else if (data.type === "error") {
+          stream.close();
+          reject(new Error(data.message || "LoRA学習に失敗しました。"));
+        }
+      };
+      stream.onerror = () => {
+        stream.close();
+        reject(new Error("LoRA学習の進捗接続が切れました。"));
+      };
+    }).then(async (model) => {
+      $("lora-training-progress-title").textContent = "LoRA学習が完了しました";
+      $("lora-training-progress-message").textContent = `${model.name} を生成画面で使用できます。`;
+      $("lora-training-progress-fill").style.width = "100%";
+      button.textContent = "学習完了";
+      await loadLoraModels(model.id);
+    });
+  } catch (error) {
+    setError(error.message);
+    $("lora-training-progress-title").textContent = "LoRA学習に失敗しました";
+    $("lora-training-progress-message").textContent = error.message;
+    button.disabled = false;
+    button.textContent = "もう一度開始";
+  }
+}
+
 function fileAsDataUrl(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -859,13 +1279,9 @@ function fileAsDataUrl(file) {
   });
 }
 
-function setComposeSource(image, label, {preserveForeground = false} = {}) {
+function setComposeSource(image, label) {
   composeSourceImage = image || "";
   composeSourceLabel = label || "";
-  if (!preserveForeground) {
-    compositionForegroundImage = composeSourceImage;
-    compositionBackgroundMask = "";
-  }
   const hasSource = Boolean(composeSourceImage);
   $("compose-source-preview").hidden = !hasSource;
   $("compose-source-empty").hidden = hasSource;
@@ -934,39 +1350,89 @@ async function runJob(payload) {
 }
 
 function showResult(data, historyPrompt) {
+  if (data.workflow === "character") {
+    rootLoraMetadata = (
+      data.character_lora_id || data.lora_id || data.style_lora_id
+    ) ? loraMetadataFromResult(data) : {};
+  } else if (
+    data.workflow === "compose"
+    && !data.character_lora_id
+    && !data.lora_id
+    && !data.style_lora_id
+    && (rootLoraMetadata.character_lora_id || rootLoraMetadata.style_lora_id)
+  ) {
+    Object.assign(data, rootLoraMetadata);
+  } else if (
+    data.workflow === "compose"
+    && (data.character_lora_id || data.lora_id || data.style_lora_id)
+  ) {
+    rootLoraMetadata = loraMetadataFromResult(data);
+  }
   currentImage = data.image;
   currentGalleryRecordId = "";
   currentImages[data.workflow] = data.image;
   currentMetadata = {
     original_prompt: rootPrompt || data.original_prompt,
+    free_prompt: data.free_prompt || "",
+    catalog_prompt: data.catalog_prompt || "",
     edit_history: [...editInstructions],
     optimized_prompt: data.optimized_prompt,
     optimizer_source: data.optimizer_source,
     intent_notes: data.intent_notes,
     refine_enabled: data.refine_enabled,
     generation_settings: data.settings,
+    image_model_profile: data.image_model_profile || "",
+    image_model_label: data.image_model_label || "",
     workflow: data.workflow,
     editor_model: data.editor_model || "",
     edit_strength: data.edit_strength ?? null,
     edit_scope: data.edit_scope || "",
     background_mask: data.background_mask || "",
+    lora_id: data.lora_id || "",
+    lora_name: data.lora_name || "",
+    lora_trigger_word: data.lora_trigger_word || "",
+    lora_weight: data.lora_weight ?? null,
+    character_lora_id: data.character_lora_id || data.lora_id || "",
+    character_lora_name: data.character_lora_name || data.lora_name || "",
+    character_lora_trigger_word: data.character_lora_trigger_word || data.lora_trigger_word || "",
+    character_lora_weight: data.character_lora_weight ?? data.lora_weight ?? null,
+    style_lora_id: data.style_lora_id || "",
+    style_lora_name: data.style_lora_name || "",
+    style_lora_trigger_word: data.style_lora_trigger_word || "",
+    style_lora_weight: data.style_lora_weight ?? null,
+    applied_loras: data.applied_loras || [],
+    generation_intent: data.generation_intent || "",
+    character_prompt: data.character_prompt || rootCharacterPrompt || "",
+    scene_prompt: data.scene_prompt || rootScenePrompt || "",
+    optimized_character_prompt: data.optimized_character_prompt || rootOptimizedCharacterPrompt || "",
+    optimized_scene_prompt: data.optimized_scene_prompt || "",
+    reference_used: Boolean(data.reference_used),
+    reference_strength: data.reference_strength ?? null,
   };
   $("result-image").src = `data:image/png;base64,${data.image}`;
   $("optimized-prompt").textContent = data.optimized_prompt;
-  $("result-workflow-label").textContent = data.workflow === "character" ? "キャラクター生成" : "背景合成 / 修正";
+  $("result-workflow-label").textContent = data.generation_intent === "story_illustration"
+    ? "ストーリー用一枚絵"
+    : data.generation_intent === "consistent_regeneration"
+      ? "キャラクター一貫再生成"
+      : data.workflow === "character" ? "キャラクター生成" : "局所修正";
   $("use-result-in-compose").hidden = data.workflow !== "character";
   $("save-r2").textContent = "R2に保存";
-  if (data.workflow === "character") setComposeSource(data.image, "キャラクター生成の結果");
+  if (data.workflow === "character") {
+    setComposeSource(data.image, "キャラクター生成の結果");
+  }
   if (data.workflow === "compose") {
-    if (data.background_mask) compositionBackgroundMask = data.background_mask;
-    setComposeSource(data.image, "直前の修正結果", {preserveForeground: Boolean(data.background_mask)});
+    setComposeSource(data.image, "直前の再生成結果");
   }
   finishProgress();
   savePromptHistory(data, historyPrompt).catch((error) => console.warn("Prompt history could not be saved", error));
 }
 
 async function generateCharacter() {
-  const prompt = promptForWorkflow("character");
+  const promptParts = promptPartsForWorkflow("character");
+  const prompt = promptParts.prompt;
+  const scenePrompt = $("character-scene-prompt").value.trim();
+  const includeScene = Boolean(scenePrompt && $("character-auto-background").checked);
   if (!prompt) return setError("キャラクターの要素を入力するか、カタログから選択してください。");
   const button = $("generate-character");
   button.disabled = true;
@@ -974,69 +1440,104 @@ async function generateCharacter() {
   try {
     const data = await runJob({
       workflow: "character", mode: "t2i", prompt,
+      character_prompt: prompt,
+      scene_prompt: includeScene ? scenePrompt : "",
+      generation_intent: includeScene ? "story_illustration" : "character_asset",
+      free_prompt: promptParts.freeText,
+      catalog_prompt: promptParts.catalogPrompt,
       refine_enabled: $("character-refine-enabled").checked,
+      ...loraGenerationSettings("character"),
       ...generationSettings(),
     });
-    rootPrompt = prompt;
+    rootCharacterPrompt = prompt;
+    rootOptimizedCharacterPrompt = data.optimized_character_prompt || data.optimized_prompt || prompt;
+    rootScenePrompt = includeScene ? scenePrompt : "";
+    rootOptimizedScenePrompt = data.optimized_scene_prompt || rootScenePrompt;
+    rootPrompt = includeScene ? `人物: ${prompt}\nシーン: ${scenePrompt}` : prompt;
     rootOptimizedPrompt = data.optimized_prompt || prompt;
     editInstructions = [];
     $("edit-history").replaceChildren();
-    showResult(data, prompt);
+    $("compose-character-definition").value = prompt;
+    applyLoraMetadataToWorkflow(loraMetadataFromResult(data), "compose");
+    showResult(data, rootPrompt);
   } catch (error) {
     setError(error.message);
     $("progress").hidden = true;
-    $("empty").hidden = false;
+    $("empty").hidden = Boolean(currentImage);
+    $("result").hidden = !currentImage;
   } finally {
     button.disabled = false;
   }
 }
 
 async function generateCompose() {
-  const prompt = promptForWorkflow("compose");
+  const promptParts = promptPartsForWorkflow("compose");
+  const prompt = promptParts.prompt;
   const method = $("compose-method").value;
-  if (!composeSourceImage) return setError("編集元の画像を選択してください。");
+  const characterDefinition = $("compose-character-definition").value.trim()
+    || rootCharacterPrompt
+    || rootOptimizedCharacterPrompt;
+  if (!composeSourceImage) return setError("キャラクター参照画像を選択してください。");
   if (!prompt) return setError("背景・構図・修正内容を入力するか、カタログから選択してください。");
-  if (method === "integrated" && !rootPrompt) {
-    return setError("イベントCGとして再生成するには、先にこのアプリでキャラクターを生成してください。任意画像を使う場合は背景だけ置換を選択してください。");
+  if (method === "regenerate" && !characterDefinition) {
+    return setError("保持するキャラクター定義を入力してください。LoRAだけでなく、髪・目・衣装などの固定条件も使用します。");
   }
   const button = $("generate-compose");
   button.disabled = true;
-  beginProgress("背景と構図の指示を準備しています");
+  beginProgress(method === "regenerate"
+    ? "キャラクター条件と変更内容を分けて準備しています"
+    : "手動マスクの局所修正を準備しています");
   addEditHistory(prompt);
   try {
     const maskFile = $("compose-mask").files[0];
     const maskImage = maskFile ? await fileAsDataUrl(maskFile) : "";
-    const editScope = $("compose-edit-scope").value;
-    const useSceneContext = Boolean(editScope === "background" && !maskImage && compositionForegroundImage && compositionBackgroundMask);
-    const requestPrompt = editScope === "background" && editInstructions.length
-      ? [...editInstructions, prompt].join("\n") : prompt;
-    const lockCharacter = method === "integrated" && $("compose-lock-character").checked;
+    if (method === "manual_inpaint" && !maskImage) {
+      throw new Error("局所修正では、白い領域を変更対象にした手動マスクを選択してください。");
+    }
+    const lockCharacter = method === "regenerate" && $("compose-lock-character").checked;
     const payload = {
       workflow: "compose",
-      mode: method === "integrated" ? "t2i" : "edit",
-      prompt: requestPrompt,
+      mode: method === "regenerate" ? "t2i" : "edit",
+      generation_intent: method === "regenerate" ? "consistent_regeneration" : "manual_edit",
+      prompt,
+      free_prompt: promptParts.freeText,
+      catalog_prompt: promptParts.catalogPrompt,
       refine_enabled: $("compose-refine-enabled").checked,
       ...generationSettings(),
     };
-    if (method === "integrated" && lockCharacter) {
-      payload.lock_character_outfit = true;
-      payload.locked_character_prompt = rootOptimizedPrompt || rootPrompt;
-    }
-    if (method === "inpaint") {
+    if (method === "regenerate") {
+      Object.assign(payload, loraGenerationSettings("compose"), {
+        character_prompt: characterDefinition,
+        lock_character_outfit: lockCharacter,
+        locked_character_prompt: rootOptimizedCharacterPrompt || characterDefinition,
+        source_scene_prompt: rootOptimizedScenePrompt || rootScenePrompt,
+        reference_image: composeSourceImage,
+        reference_strength: Number($("compose-reference-strength").value) / 100,
+      });
+    } else {
       Object.assign(payload, {
-        source_image: useSceneContext ? compositionForegroundImage : composeSourceImage,
+        source_image: composeSourceImage,
         mask_image: maskImage,
         editor_model: "waifu_inpaint_xl",
-        edit_scope: editScope,
-        background_mask_image: useSceneContext ? compositionBackgroundMask : "",
+        edit_scope: "full",
         edit_strength: Number($("compose-strength").value) / 100,
       });
     }
     const data = await runJob(payload);
-    rootPrompt = rootPrompt || prompt;
+    rootCharacterPrompt = characterDefinition || rootCharacterPrompt;
+    rootOptimizedCharacterPrompt = data.optimized_character_prompt || rootOptimizedCharacterPrompt;
+    rootScenePrompt = prompt;
+    rootOptimizedScenePrompt = data.optimized_scene_prompt || prompt;
+    rootPrompt = rootPrompt || `人物: ${rootCharacterPrompt}\n変更: ${prompt}`;
     editInstructions.push(prompt);
     showResult(data, prompt);
-    $("edit-history").append(createElement("div", "assistant", "AI: 修正画像を生成しました。"));
+    $("edit-history").append(createElement(
+      "div",
+      "assistant",
+      method === "regenerate"
+        ? "AI: LoRAと参照画像を使って一枚絵を再生成しました。"
+        : "AI: 手動マスクの範囲を局所修正しました。",
+    ));
     $("compose-prompt").value = "";
     $("compose-mask").value = "";
   } catch (error) {
@@ -1092,8 +1593,20 @@ function bindEvents() {
   $("compose-strength").addEventListener("input", () => {
     $("compose-strength-value").value = $("compose-strength").value;
   });
-  $("compose-edit-scope").addEventListener("change", syncComposeEditControls);
+  $("compose-reference-strength").addEventListener("input", () => {
+    $("compose-reference-strength-value").value = $("compose-reference-strength").value;
+  });
+  ["character", "compose"].forEach((workflow) => {
+    $(`${workflow}-lora-weight`).addEventListener("input", () => {
+      $(`${workflow}-lora-weight-value`).value = $(`${workflow}-lora-weight`).value;
+    });
+    $(`${workflow}-style-lora-weight`).addEventListener("input", () => {
+      $(`${workflow}-style-lora-weight-value`).value = $(`${workflow}-style-lora-weight`).value;
+    });
+  });
   $("compose-method").addEventListener("change", syncComposeEditControls);
+  $("character-auto-background").addEventListener("change", syncCharacterCommand);
+  $("character-scene-prompt").addEventListener("input", syncCharacterCommand);
   $("generate-character").addEventListener("click", generateCharacter);
   $("generate-compose").addEventListener("click", generateCompose);
   $("save-r2").addEventListener("click", saveToR2);
@@ -1105,7 +1618,11 @@ function bindEvents() {
     link.click();
   });
   $("use-character-result").addEventListener("click", () => {
-    if (currentImages.character) setComposeSource(currentImages.character, "キャラクター生成の結果");
+    if (currentImages.character) {
+      setComposeSource(currentImages.character, "キャラクター生成の結果");
+      $("compose-character-definition").value = rootCharacterPrompt || rootOptimizedCharacterPrompt;
+      applyLoraMetadataToWorkflow(rootLoraMetadata, "compose");
+    }
   });
   $("use-result-in-compose").addEventListener("click", () => setWorkflow("compose"));
   $("compose-source-file").addEventListener("change", async () => {
@@ -1114,7 +1631,13 @@ function bindEvents() {
     try {
       const dataUrl = await fileAsDataUrl(file);
       setComposeSource(dataUrl.slice(dataUrl.indexOf(",") + 1), file.name);
-      $("compose-method").value = "inpaint";
+      rootLoraMetadata = {};
+      rootCharacterPrompt = "";
+      rootOptimizedCharacterPrompt = "";
+      rootScenePrompt = "";
+      rootOptimizedScenePrompt = "";
+      $("compose-character-definition").value = "";
+      $("compose-method").value = "regenerate";
       syncComposeEditControls();
     } catch {
       setError("画像ファイルを読み込めませんでした。");
@@ -1146,8 +1669,51 @@ function bindEvents() {
   $("gallery-folder-rename").addEventListener("click", renameGalleryFolder);
   $("gallery-folder-delete").addEventListener("click", deleteGalleryFolder);
   $("gallery-preview-close").addEventListener("click", () => $("gallery-preview-dialog").close());
+  $("gallery-preview-regenerate").addEventListener("click", () => {
+    useGalleryRecordForRegeneration(
+      galleryRecords.find((record) => record.id === currentGalleryRecordId)
+    );
+  });
+  $("gallery-preview-train").addEventListener("click", () => {
+    openLoraTraining(galleryRecords.find((record) => record.id === currentGalleryRecordId));
+  });
+  $("gallery-context-regenerate").addEventListener("click", () => {
+    useGalleryRecordForRegeneration(
+      galleryRecords.find((record) => record.id === galleryContextRecordId)
+    );
+  });
+  $("gallery-context-train").addEventListener("click", () => {
+    openLoraTraining(galleryRecords.find((record) => record.id === galleryContextRecordId));
+  });
+  $("gallery-context-move").addEventListener("click", () => {
+    const record = galleryRecords.find((entry) => entry.id === galleryContextRecordId);
+    if (record) openGalleryMove(record);
+  });
   $("gallery-move-close").addEventListener("click", () => $("gallery-move-dialog").close());
   $("gallery-move-confirm").addEventListener("click", moveGalleryRecord);
+  $("lora-training-close").addEventListener("click", () => $("lora-training-dialog").close());
+  $("lora-category").addEventListener("change", syncLoraTrainingCategory);
+  $("lora-training-start").addEventListener("click", startLoraTraining);
+  $("lora-upload").addEventListener("change", async () => {
+    const category = $("lora-category").value;
+    const maximum = loraImageLimits[category] || 30;
+    const remaining = Math.max(0, maximum - loraTrainingSelectedIds.size - loraTrainingUploads.length);
+    const files = [...$("lora-upload").files].slice(0, remaining);
+    for (const file of files) {
+      loraTrainingUploads.push({
+        id: crypto.randomUUID(),
+        name: file.name,
+        dataUrl: await fileAsDataUrl(file),
+      });
+    }
+    $("lora-upload").value = "";
+    renderLoraDataset();
+  });
+  document.addEventListener("pointerdown", (event) => {
+    if (!$("gallery-context-menu").hidden && !$("gallery-context-menu").contains(event.target)) {
+      closeGalleryContextMenu();
+    }
+  });
 
   catalogWorkflows.forEach((workflow) => {
     $(catalogId(workflow, "category")).addEventListener("change", () => {
@@ -1163,21 +1729,34 @@ function bindEvents() {
   });
 }
 
+function syncCharacterCommand() {
+  const story = Boolean(
+    $("character-auto-background").checked
+    && $("character-scene-prompt").value.trim()
+  );
+  $("generate-character").textContent = story
+    ? "シーン込みの一枚絵を生成"
+    : "キャラクター素材を生成";
+}
+
 function syncComposeEditControls() {
-  const integrated = $("compose-method").value === "integrated";
-  const isBackground = $("compose-edit-scope").value === "background";
-  $("compose-edit-scope-field").hidden = integrated;
-  $("compose-character-lock").hidden = !integrated;
-  $("compose-mask-settings").hidden = integrated;
-  $("compose-strength-field").hidden = integrated || isBackground;
-  $("compose-strength").value = isBackground ? 85 : 55;
+  const regenerate = $("compose-method").value === "regenerate";
+  $("compose-character-definition-field").hidden = !regenerate;
+  $("compose-character-lock").hidden = !regenerate;
+  $("compose-lora-field").hidden = !regenerate;
+  $("compose-reference-strength-field").hidden = !regenerate;
+  $("compose-mask-settings").hidden = regenerate;
+  $("compose-strength-field").hidden = regenerate;
   $("compose-strength-value").value = $("compose-strength").value;
-  $("generate-compose").textContent = integrated ? "イベントCGを生成" : "背景を合成 / 画像を修正";
+  $("generate-compose").textContent = regenerate
+    ? "同じキャラクターで再生成"
+    : "手動マスクの範囲を修正";
 }
 
 async function initialize() {
   bindEvents();
   applyPreset();
+  syncCharacterCommand();
   syncComposeEditControls();
   renderSelected("character");
   renderSelected("compose");
@@ -1191,6 +1770,11 @@ async function initialize() {
     setError(`ユーザー設定を読み込めませんでした: ${error.message}`);
   }
   renderFavoriteSettings();
+  try {
+    await loadLoraModels();
+  } catch (error) {
+    setError(`LoRA一覧を読み込めませんでした: ${error.message}`);
+  }
   await Promise.all(catalogWorkflows.map((workflow) => loadCatalog(workflow)));
   setWorkflow("character");
 }

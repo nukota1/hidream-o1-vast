@@ -1,16 +1,17 @@
-# JANKU Image Studio
+# Animagine Image Studio
 
 Japanese web application for anime image generation. It runs locally with Docker
 for development and on a rented GPU server for production.
 
 ## Runtime
 
-- Local text-to-image: Animagine XL 4.0 Opt / SDXL
-- Vast.ai text-to-image: JANKU v7.77 / Illustrious XL (unchanged for now)
-- Default image editing: ShinoharaHare/Waifu-Inpaint-XL
+- Local and Vast.ai text-to-image: Animagine XL 4.0 Zero / SDXL
+- Character reference: h94/IP-Adapter Plus for SDXL
+- Optional localized editing: ShinoharaHare/Waifu-Inpaint-XL with a user mask
 - Optional image editing: FLUX.1-Kontext-dev and HiDream-O1-Image, loaded only when selected
-- Prompt refinement: Qwen/Qwen3.5-9B on CPU, optional per request
-- Model cache: private Cloudflare R2 for JANKU
+- Prompt refinement: Qwen/Qwen3.5-9B on GPU, optional per request
+- Character and style training: separate SDXL LoRAs on Animagine XL 4.0 Zero
+- Optional legacy model cache: private Cloudflare R2 for JANKU
 - Generated image storage: private Cloudflare R2
 - Backend and UI: Flask
 - Public gateway: Cloudflare Worker reverse proxy
@@ -24,12 +25,15 @@ Use the local Docker Compose configuration for normal development and testing.
 It uses the same application image as production, exposes the app at
 `http://127.0.0.1:7861`, and keeps all downloaded models in the named Docker
 volume `janku-models-local`. Recreating the container does not download models
-again.
+again. Python/CUDA packages persist in `janku-python-local`, so dependency
+installation is also skipped after the first successful setup.
 
-Waifu-Inpaint-XL is the default editor and fits alongside this application's
-single-active-model design on a 32GB GPU. The active text model is unloaded before an edit model
-loads, and the editor is unloaded before the next JANKU generation. Reserve at
-least 80GB of Docker disk for JANKU, Waifu-Inpaint-XL, and the prompt refiner.
+IP-Adapter Plus is loaded into the active SDXL pipeline only when a reference
+image is used. Waifu-Inpaint-XL is retained for explicit user-mask corrections
+and is not part of the default background workflow. The active text model is
+unloaded before an edit model loads, and the editor is unloaded before the next
+SDXL generation. Reserve at least 80GB of Docker disk for the image model,
+prompt refiner, and reference adapter.
 FLUX.1-Kontext-dev and HiDream-O1-Image are intentionally not downloaded until
 they are chosen in the web UI; reserve substantially more disk when using either.
 
@@ -43,9 +47,10 @@ they are chosen in the web UI; reserve substantially more disk when using either
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\local.ps1 start
 ```
 
-The first local startup downloads Animagine XL 4.0 Opt, Waifu-Inpaint-XL, and
-Qwen3.5-9B from Hugging Face. It starts the web app immediately while these models are
-cached in the background. Check readiness and download progress with:
+The first local startup downloads Animagine XL 4.0 Zero, Qwen3.5-9B, and the
+SDXL IP-Adapter Plus reference model. It starts the web app
+immediately while these models are cached in the background. Check readiness
+and download progress with:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\local.ps1 logs
@@ -53,10 +58,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\local.ps1 logs
 
 Other commands are `stop`, `restart`, `status`, and `build`.
 
-## Local Animagine defaults
+## Animagine XL 4.0 Zero defaults
 
-Animagine XL 4.0 Opt uses ordered Danbooru tags. The local application uses the
-officially recommended settings:
+Animagine XL 4.0 Zero is the LoRA/fine-tuning base published by CagliostroLab.
+Local and Vast.ai use the same exact model profile so a LoRA is never silently
+applied to a different checkpoint. It uses ordered Danbooru tags and the
+application uses the officially recommended settings:
 
 ```text
 Sampler: Euler A
@@ -67,6 +74,10 @@ Clip Skip: 2
 
 The local Qwen3.5-9B refiner translates Japanese into Animagine-compatible
 ordered tags and appends `masterpiece, high score, great score, absurdres`.
+Free-form text is refined first and kept ahead of prompt-catalog tags. The
+standard PyTorch execution path is used; optional Hub activation kernels are
+disabled because their current builds are not ABI-compatible with this
+project's Torch 2.7.1 runtime.
 
 The web UI provides presets for bishoujo visual-novel CG, anime illustration,
 manga, light-novel illustration, and custom settings. Every value can be changed
@@ -91,36 +102,93 @@ ghcr.io/nukota1/hidream-o1-image:latest
 Copy the variables from `deploy/vast/env.vast.example` into the Vast.ai template.
 Do not put model weights or secrets in Git.
 
-JANKU is downloaded from:
+Animagine XL 4.0 Zero is downloaded directly from
+`cagliostrolab/animagine-xl-4.0-zero`. JANKU remains an optional legacy
+configuration and is not the production default.
 
-```text
-s3://ai-model-cache/models/JANKUTrainedChenkinNoobai_v777.safetensors
-```
-
-Waifu-Inpaint-XL and the prompt refiner are prefetched from Hugging Face.
+IP-Adapter Plus and the prompt refiner are prefetched from Hugging Face.
+Waifu-Inpaint-XL is downloaded only when the manual-mask workflow is used.
 FLUX.1-Kontext-dev and HiDream-O1-Image are downloaded only when selected in
 the image-editing model list.
 
 ## Image editing models
 
-The image editing panel offers three workflows:
+The standard story-illustration workflow separates `キャラクターの要素` from
+`背景・シーン`, refines them independently, and then places identity tags ahead
+of scene and style tags in one full-frame SDXL generation. It never creates a
+silhouette mask, so there is no chroma fringe or segmentation seam.
 
-1. **Waifu-Inpaint-XL**: default anime inpainting workflow. Uploading a mask
-   edits white areas and preserves black areas. Without a mask, it uses a
-   balanced whole-image edit. The web UI provides an edit-strength slider:
-   around 40 favors the source image, 55 is balanced, and 65 or more favors the
-   requested change. Use a mask for a large, localized change while preserving
-   the rest of the character.
-2. **FLUX.1-Kontext-dev**: instruction-based image editing workflow. It is
-   downloaded only after selection; its current workflow does not use a mask.
-3. **HiDream-O1-Image**: instruction-based editing with the official full
-   HiDream model. It is downloaded only after selection; its current workflow
-   does not use a mask.
+The composition panel offers two workflows:
+
+1. **Consistent full-frame regeneration**: the default ADV/event-CG workflow.
+   The source image is passed through SDXL IP-Adapter Plus. A selected Character
+   LoRA supplies repeatable identity, a separate Style LoRA supplies reusable
+   line and rendering style, and the character definition is ordered
+   before the requested expression, pose, camera, and background. The reference
+   strength is adjustable: lower values permit larger pose/composition changes;
+   higher values retain more of the source appearance.
+2. **Manual-mask localized correction**: Waifu-Inpaint-XL edits only the white
+   area of a user-supplied mask. Automatic silhouette extraction is deliberately
+   not used. This is an advanced repair tool, not the background-change path.
+
+FLUX.1-Kontext-dev and HiDream-O1-Image remain optional instruction-editing
+backends in the server code, but they are not the default consistency workflow.
 
 Before the first Waifu or FLUX download, log into Hugging Face, accept each
 model's access conditions, create a read token, and set `HF_TOKEN`. A missing
 approval or token is reported in the app instead of preventing the server from
 starting.
+
+## Character and Style LoRA training
+
+Open the gallery and right-click, long-press, or use a card's menu button, then
+choose `このイラストで追加学習する`. The training dialog accepts:
+
+- LoRA name and trigger word
+- a fixed character definition and fixed negative traits for immutable face,
+  hair, eye, and body traits
+- character, style, pose, or background category
+- the active SDXL base-model type
+- selected gallery images and additional uploaded images
+- automatic or explicit training steps
+
+One-image training is available for experiments, but ten or more images of the
+same character with varied angles, expressions, poses, and lighting are
+recommended. Training runs as an exclusive GPU job and reports progress over
+SSE. Datasets, metadata, and final weights are stored per user under
+`/models/loras`. A completed LoRA appears in its matching Character or Style
+selector. Both can be active with independent weights; their trigger words,
+exact base-model profile, and weights are recorded with the generated asset.
+Former Animagine Opt and JANKU LoRAs are marked incompatible instead of being
+loaded on Zero.
+
+The fixed character definition accepts Japanese and is stored with the LoRA.
+When that LoRA is selected, the definition is automatically merged ahead of
+the scene and optional style tags so users do not need to repeat identity
+details for every image.
+
+Per-image sidecar captions or `captions.json` separate clothing, background,
+pose, and expression from character identity. Portrait inputs use
+aspect-ratio-preserving 64-pixel buckets instead of a square center crop, and
+character training does not randomly mirror asymmetric features. The automatic
+step recommendation is `image count * 20`, clamped to 200-800 steps.
+
+Style LoRA uses a separate policy: prepare multiple characters, clothes, poses,
+backgrounds, and compositions that share one visual style. The UI recommends
+at least 50 images, uses rank 32, learning rate `5e-5`, horizontal flip, and a
+starting inference weight of 0.6. A reusable Style LoRA should not be trained
+from only one character because identity and style would become entangled.
+
+If a dataset constant such as a white background leaks into generations, record
+it in the model's `training_leakage_tags`; the app adds unrequested constants to
+the negative prompt. Use `scripts/evaluate_character_lora.py` for deterministic
+baseline/checkpoint comparisons before registering a weight.
+
+LoRA training and instant reference conditioning remain separate assets but are
+combined at inference time: Character LoRA provides long-term identity, Style
+LoRA provides reusable rendering style, and IP-Adapter uses the selected source
+image as appearance guidance for the current generation. Gallery images can be
+sent directly to the consistency-regeneration screen.
 
 ## Storage
 
@@ -139,5 +207,6 @@ IndexedDB fallback for development.
 
 ## Build
 
-Pushing `main` triggers `.github/workflows/build-ghcr.yml` and publishes both
-`latest` and commit-SHA tags to GHCR.
+Pull requests to `main` trigger a container build without publishing. Pushing
+`main` triggers the same workflow and publishes both `latest` and commit-SHA
+tags to GHCR and Docker Hub.

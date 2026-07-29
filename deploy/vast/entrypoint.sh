@@ -4,37 +4,52 @@ set -euo pipefail
 : "${APP_HOST:=0.0.0.0}"
 : "${APP_PORT:=7861}"
 : "${HF_HOME:=/models/huggingface}"
-: "${IMAGE_MODEL_FAMILY:=janku}"
+: "${U2NET_HOME:=/models/rembg}"
+: "${LORA_ROOT:=/models/loras}"
+: "${IMAGE_MODEL_FAMILY:=animagine}"
 if [ "$IMAGE_MODEL_FAMILY" = "animagine" ]; then
   : "${APP_NAME:=Animagine Image Studio}"
-  : "${IMAGE_MODEL_LABEL:=Animagine XL 4.0 Opt}"
+  : "${IMAGE_MODEL_PROFILE:=sdxl-animagine-zero}"
+  : "${IMAGE_MODEL_LABEL:=Animagine XL 4.0 Zero}"
 else
   : "${APP_NAME:=JANKU Image Studio}"
+  : "${IMAGE_MODEL_PROFILE:=sdxl-janku-v777}"
   : "${IMAGE_MODEL_LABEL:=JANKU v7.77}"
 fi
 : "${JANKU_MODEL_PATH:=/models/checkpoints/JANKUTrainedChenkinNoobai_v777.safetensors}"
 : "${JANKU_MODEL_MIN_BYTES:=6900000000}"
 : "${JANKU_R2_BUCKET:=ai-model-cache}"
 : "${JANKU_R2_KEY:=models/JANKUTrainedChenkinNoobai_v777.safetensors}"
-: "${ANIMAGINE_MODEL_REPO:=cagliostrolab/animagine-xl-4.0}"
-: "${ANIMAGINE_MODEL_FILE:=animagine-xl-4.0-opt.safetensors}"
-: "${ANIMAGINE_MODEL_PATH:=/models/checkpoints/animagine-xl-4.0-opt.safetensors}"
+: "${ANIMAGINE_MODEL_REPO:=cagliostrolab/animagine-xl-4.0-zero}"
+: "${ANIMAGINE_MODEL_CONFIG:=cagliostrolab/animagine-xl-4.0-zero}"
+: "${ANIMAGINE_MODEL_FILE:=animagine-xl-4.0-zero.safetensors}"
+: "${ANIMAGINE_MODEL_PATH:=/models/checkpoints/animagine-xl-4.0-zero.safetensors}"
 : "${ANIMAGINE_MODEL_MIN_BYTES:=6900000000}"
 : "${MODEL_DOWNLOAD_ON_START:=1}"
 : "${WAIFU_INPAINT_MODEL:=ShinoharaHare/Waifu-Inpaint-XL}"
-: "${WAIFU_INPAINT_DOWNLOAD_ON_START:=1}"
+: "${WAIFU_INPAINT_DOWNLOAD_ON_START:=0}"
+: "${IP_ADAPTER_MODEL:=h94/IP-Adapter}"
+: "${IP_ADAPTER_SUBFOLDER:=sdxl_models}"
+: "${IP_ADAPTER_WEIGHT_NAME:=ip-adapter-plus_sdxl_vit-h.safetensors}"
+: "${IP_ADAPTER_IMAGE_ENCODER_FOLDER:=models/image_encoder}"
+: "${IP_ADAPTER_DOWNLOAD_ON_START:=1}"
 : "${FLUX_KONTEXT_MODEL:=black-forest-labs/FLUX.1-Kontext-dev}"
 : "${HIDREAM_O1_IMAGE_MODEL:=HiDream-ai/HiDream-O1-Image}"
 : "${HIDREAM_O1_IMAGE_PATH:=/models/HiDream-O1-Image}"
 : "${PROMPT_REFINER_MODEL:=Qwen/Qwen3.5-9B}"
+: "${ANIME_SEGMENTATION_MODEL:=isnet-anime}"
+: "${ANIME_SEGMENTATION_DOWNLOAD_ON_START:=0}"
 : "${PROMPT_REFINER_DOWNLOAD_ON_START:=1}"
 : "${RUNTIME_SETUP_ON_START:=1}"
 : "${PYTORCH_INDEX_URL:=https://download.pytorch.org/whl/cu128}"
 : "${PYTORCH_VERSION:=2.7.1}"
 : "${TORCHVISION_VERSION:=0.22.1}"
 : "${PROMPT_REFINER_LOCAL_FILES_ONLY:=1}"
+: "${PROMPT_REFINER_USE_KERNELS:=0}"
 
-export HF_HOME PROMPT_REFINER_LOCAL_FILES_ONLY
+export APP_NAME IMAGE_MODEL_FAMILY IMAGE_MODEL_LABEL IMAGE_MODEL_PROFILE
+export ANIMAGINE_MODEL_REPO ANIMAGINE_MODEL_CONFIG ANIMAGINE_MODEL_FILE ANIMAGINE_MODEL_PATH ANIMAGINE_MODEL_MIN_BYTES
+export HF_HOME U2NET_HOME LORA_ROOT ANIME_SEGMENTATION_MODEL PROMPT_REFINER_LOCAL_FILES_ONLY PROMPT_REFINER_USE_KERNELS
 
 pip_install_with_retry() {
   local attempt=1
@@ -52,7 +67,13 @@ pip_install_with_retry() {
 }
 
 runtime_dependencies_ready() {
-  python3 -c 'import torch, transformers, diffusers, flask, boto3; assert torch.cuda.is_available()' >/dev/null 2>&1
+  python3 -c '
+import torch, transformers, diffusers, flask, boto3, rembg, peft, safetensors
+from transformers import CLIPTextModel
+assert torch.cuda.is_available()
+assert transformers.__version__ == "5.14.1"
+assert diffusers.__version__ == "0.39.0"
+' >/dev/null 2>&1
 }
 
 install_runtime_dependencies() {
@@ -72,11 +93,17 @@ install_runtime_dependencies() {
 
   if [ ! -d /opt/hidream-o1-image/.git ]; then
     echo "[entrypoint] Downloading optional HiDream editor source."
-    git clone --depth 1 https://github.com/HiDream-ai/HiDream-O1-Image.git /opt/hidream-o1-image
+    if ! git clone --depth 1 https://github.com/HiDream-ai/HiDream-O1-Image.git /opt/hidream-o1-image; then
+      echo "[entrypoint] Optional HiDream source download failed; standard generation will continue."
+    fi
   fi
-  sed -E '/^(torch|torchvision|transformers|flash-attn)/d' /opt/hidream-o1-image/requirements.txt > /tmp/hidream-requirements.txt
-  pip_install_with_retry -r /tmp/hidream-requirements.txt
-  sed -i 's/"use_flash_attn": True/"use_flash_attn": False/' /opt/hidream-o1-image/models/pipeline.py
+  if [ -d /opt/hidream-o1-image/.git ]; then
+    sed -E '/^(torch|torchvision|transformers|flash-attn)/d' /opt/hidream-o1-image/requirements.txt > /tmp/hidream-requirements.txt
+    if ! pip_install_with_retry -r /tmp/hidream-requirements.txt; then
+      echo "[entrypoint] Optional HiDream dependencies failed; standard generation will continue."
+    fi
+    sed -i 's/"use_flash_attn": True/"use_flash_attn": False/' /opt/hidream-o1-image/models/pipeline.py
+  fi
 
   runtime_dependencies_ready
 }
@@ -131,7 +158,7 @@ download_animagine_model() {
     echo "[entrypoint] Animagine model already present: $ANIMAGINE_MODEL_PATH"
     return 0
   fi
-  echo "[entrypoint] Downloading Animagine XL 4.0 Opt from Hugging Face"
+  echo "[entrypoint] Downloading $IMAGE_MODEL_LABEL from Hugging Face"
   mkdir -p "$(dirname "$ANIMAGINE_MODEL_PATH")"
   hf download "$ANIMAGINE_MODEL_REPO" "$ANIMAGINE_MODEL_FILE" \
     --local-dir "$(dirname "$ANIMAGINE_MODEL_PATH")"
@@ -165,11 +192,30 @@ prefetch_models() {
     fi
   fi
 
+  if [ "$IP_ADAPTER_DOWNLOAD_ON_START" = "1" ]; then
+    echo "[entrypoint] Prefetching character reference adapter: $IP_ADAPTER_MODEL"
+    hf download "$IP_ADAPTER_MODEL" \
+      "${IP_ADAPTER_SUBFOLDER}/${IP_ADAPTER_WEIGHT_NAME}" \
+      "${IP_ADAPTER_IMAGE_ENCODER_FOLDER}/config.json" \
+      "${IP_ADAPTER_IMAGE_ENCODER_FOLDER}/model.safetensors"
+    if [ $? -ne 0 ]; then
+      echo "[entrypoint] Character reference adapter prefetch failed."
+    fi
+  fi
+
   if [ "$PROMPT_REFINER_DOWNLOAD_ON_START" = "1" ]; then
     echo "[entrypoint] Prefetching prompt refiner: $PROMPT_REFINER_MODEL"
     hf download "$PROMPT_REFINER_MODEL"
     if [ $? -ne 0 ]; then
       echo "[entrypoint] Prompt refiner prefetch failed."
+    fi
+  fi
+
+  if [ "$ANIME_SEGMENTATION_DOWNLOAD_ON_START" = "1" ]; then
+    echo "[entrypoint] Prefetching anime segmentation model: $ANIME_SEGMENTATION_MODEL"
+    python3 -c 'import os; from rembg import new_session; new_session(os.environ["ANIME_SEGMENTATION_MODEL"])'
+    if [ $? -ne 0 ]; then
+      echo "[entrypoint] Anime segmentation prefetch failed."
     fi
   fi
   echo "[entrypoint] Background model prefetch finished."

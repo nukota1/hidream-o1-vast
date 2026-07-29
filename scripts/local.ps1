@@ -6,6 +6,9 @@ param(
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $ComposeFile = Join-Path $ProjectRoot "docker-compose.local.yml"
+$ComposeProject = "janku-local"
+$ModelsVolume = "janku-models-local"
+$RuntimeVolume = "janku-python-local"
 
 if (-not (Test-Path (Join-Path $ProjectRoot ".env"))) {
     throw "Missing .env. Copy .env.example to .env and set the R2 credentials."
@@ -17,12 +20,53 @@ if (-not (Test-Path (Join-Path $ProjectRoot ".env.local"))) {
     exit 0
 }
 
-$compose = @("compose", "-f", $ComposeFile)
+$legacyCompose = Get-Command "docker-compose" -ErrorAction SilentlyContinue
+if ($legacyCompose) {
+    $composeCommand = $legacyCompose.Source
+    $composePrefix = @()
+} else {
+    $composeCommand = "docker"
+    $composePrefix = @("compose")
+}
+$compose = @("-p", $ComposeProject, "-f", $ComposeFile)
+
+function Invoke-LocalCompose {
+    param([string[]]$ComposeActionArgs)
+
+    & $composeCommand @composePrefix @compose @ComposeActionArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Docker Compose failed with exit code $LASTEXITCODE."
+    }
+}
+
+function Ensure-LocalVolume {
+    param([string]$VolumeName)
+
+    $existingVolumes = @(
+        & docker volume ls --filter "name=$VolumeName" --format "{{.Name}}"
+    )
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not list Docker volumes."
+    }
+    if ($existingVolumes -contains $VolumeName) {
+        return
+    }
+    & docker volume create $VolumeName | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not create Docker volume $VolumeName."
+    }
+}
+
+function Ensure-LocalVolumes {
+    Ensure-LocalVolume $ModelsVolume
+    Ensure-LocalVolume $RuntimeVolume
+}
+
 switch ($Action) {
-    "start"   { & docker @compose up --build --detach }
-    "stop"    { & docker @compose down }
-    "restart" { & docker @compose up --build --detach --force-recreate }
-    "logs"    { & docker @compose logs --follow --tail 200 }
-    "status"  { & docker @compose ps }
-    "build"   { & docker @compose build }
+    "start"   { Ensure-LocalVolumes; Invoke-LocalCompose @("up", "--build", "--detach") }
+    "stop"    { Invoke-LocalCompose @("down") }
+    "restart" { Ensure-LocalVolumes; Invoke-LocalCompose @("up", "--build", "--detach", "--force-recreate") }
+    "logs"    { Invoke-LocalCompose @("logs", "--follow", "--tail", "200") }
+    "status"  { Invoke-LocalCompose @("ps") }
+    "build"   { Invoke-LocalCompose @("build") }
 }

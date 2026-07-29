@@ -1,3 +1,5 @@
+name: janku-local
+
 services:
   janku-studio:
     build:
@@ -14,16 +16,32 @@ services:
       APP_HOST: 0.0.0.0
       APP_PORT: 7861
       HF_HOME: /models/huggingface
+      U2NET_HOME: /models/rembg
+      LORA_ROOT: /models/loras
+      ANIME_SEGMENTATION_MODEL: isnet-anime
       APP_NAME: Animagine Image Studio
       IMAGE_MODEL_FAMILY: animagine
-      IMAGE_MODEL_LABEL: Animagine XL 4.0 Opt
+      IMAGE_MODEL_PROFILE: sdxl-animagine-zero
+      IMAGE_MODEL_LABEL: Animagine XL 4.0 Zero
       PROMPT_REFINER_LOCAL_FILES_ONLY: "1"
-      ANIMAGINE_MODEL_REPO: cagliostrolab/animagine-xl-4.0
-      ANIMAGINE_MODEL_FILE: animagine-xl-4.0-opt.safetensors
-      ANIMAGINE_MODEL_PATH: /models/checkpoints/animagine-xl-4.0-opt.safetensors
+      PROMPT_REFINER_USE_KERNELS: "0"
+      ANIMAGINE_MODEL_REPO: cagliostrolab/animagine-xl-4.0-zero
+      ANIMAGINE_MODEL_CONFIG: cagliostrolab/animagine-xl-4.0-zero
+      ANIMAGINE_MODEL_FILE: animagine-xl-4.0-zero.safetensors
+      ANIMAGINE_MODEL_PATH: /models/checkpoints/animagine-xl-4.0-zero.safetensors
       ANIMAGINE_MODEL_MIN_BYTES: 6900000000
+      IP_ADAPTER_MODEL: h94/IP-Adapter
+      IP_ADAPTER_SUBFOLDER: sdxl_models
+      IP_ADAPTER_WEIGHT_NAME: ip-adapter-plus_sdxl_vit-h.safetensors
+      IP_ADAPTER_IMAGE_ENCODER_FOLDER: models/image_encoder
+      IP_ADAPTER_DEFAULT_SCALE: "0.25"
+      IP_ADAPTER_CHARACTER_CROP: "1"
+      IP_ADAPTER_DOWNLOAD_ON_START: "1"
+      WAIFU_INPAINT_DOWNLOAD_ON_START: "0"
+      ANIME_SEGMENTATION_DOWNLOAD_ON_START: "0"
     volumes:
       - janku-models-local:/models
+      - janku-python-local:/venv/main
     gpus: all
     init: true
     restart: unless-stopped
@@ -31,3 +49,7 @@ services:
 volumes:
   janku-models-local:
     name: janku-models-local
+    external: true
+  janku-python-local:
+    name: janku-python-local
+    external: true

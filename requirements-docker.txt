@@ -1,5 +1,6 @@
-git+https://github.com/huggingface/transformers.git
-git+https://github.com/huggingface/diffusers.git
+transformers==5.14.1
+diffusers==0.39.0
+rembg[cpu]==2.0.69
 accelerate
 einops
 numpy
@@ -9,7 +10,6 @@ scipy
 flask
 python-dotenv
 huggingface_hub
-kernels
 boto3
 peft
 safetensors

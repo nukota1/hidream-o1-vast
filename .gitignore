@@ -100,6 +100,7 @@ models-cache/
 huggingface/
 
 # Generated outputs
+input/
 outputs/
 results/
 samples/

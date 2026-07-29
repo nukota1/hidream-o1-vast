@@ -1,5 +1,7 @@
 import os
+import re
 import time
+from pathlib import Path
 
 import torch
 
@@ -36,7 +38,7 @@ def _image_model_family():
 def _animagine_model_path():
     return os.environ.get(
         "ANIMAGINE_MODEL_PATH",
-        "/models/checkpoints/animagine-xl-4.0-opt.safetensors",
+        "/models/checkpoints/animagine-xl-4.0-zero.safetensors",
     )
 
 
@@ -239,16 +241,24 @@ def load_janku_pipeline(status_callback=None):
     if _image_model_family() == "animagine":
         model_path = _animagine_model_path()
         _wait_for_model_file(model_path, _animagine_min_bytes(), status_callback=status_callback)
-        print(f"[sdxl] Loading Animagine XL 4.0 Opt model: {model_path}")
+        model_label = os.environ.get(
+            "IMAGE_MODEL_LABEL",
+            "Animagine XL 4.0 Zero",
+        ).strip()
+        model_config = os.environ.get(
+            "ANIMAGINE_MODEL_CONFIG",
+            "cagliostrolab/animagine-xl-4.0-zero",
+        ).strip()
+        print(f"[sdxl] Loading {model_label} model: {model_path}")
         if status_callback:
-            status_callback("Loading Animagine XL 4.0 Opt into GPU memory")
+            status_callback(f"Loading {model_label} into GPU memory")
         return _load_single_file_or_repo(
             AutoPipelineForText2Image,
             model_path,
             _torch_dtype(),
             single_file_pipeline_cls=StableDiffusionXLPipeline,
             single_file_kwargs={
-                "config": "cagliostrolab/animagine-xl-4.0",
+                "config": model_config,
                 "custom_pipeline": "lpw_stable_diffusion_xl",
                 "add_watermarker": False,
             },
@@ -270,6 +280,26 @@ def load_janku_pipeline(status_callback=None):
 
 def _generator(seed):
     return torch.Generator(device=_device()).manual_seed(int(seed))
+
+
+def prepare_character_reference(image):
+    """Focus IP-Adapter on a typical centered ADV character, not the old scene."""
+    reference = image.convert("RGB")
+    enabled = os.environ.get(
+        "IP_ADAPTER_CHARACTER_CROP",
+        "1",
+    ).strip().lower() not in {"0", "false", "no", "off"}
+    if not enabled:
+        return reference
+    width, height = reference.size
+    if width < 64 or height < 64:
+        return reference
+    return reference.crop((
+        int(width * 0.15),
+        int(height * 0.05),
+        int(width * 0.85),
+        int(height * 0.85),
+    ))
 
 
 def _set_sampler(pipe, sampler):
@@ -325,7 +355,13 @@ def fit_prompt_for_sdxl(pipe, prompt):
     return compact
 
 
-def generate_with_janku(pipe, prompt, settings, callback=None):
+def generate_with_janku(
+    pipe,
+    prompt,
+    settings,
+    callback=None,
+    reference_image=None,
+):
     steps = int(settings["steps"])
     _set_sampler(pipe, settings["sampler"])
 
@@ -334,15 +370,106 @@ def generate_with_janku(pipe, prompt, settings, callback=None):
             callback(step, steps)
         return callback_kwargs
 
+    pipeline_args = {
+        "prompt": prompt,
+        "negative_prompt": settings["negative_prompt"],
+        "width": int(settings["width"]),
+        "height": int(settings["height"]),
+        "num_inference_steps": steps,
+        "guidance_scale": float(settings["cfg"]),
+        "clip_skip": int(settings["clip_skip"]),
+        "generator": _generator(settings["seed"]),
+        "callback_on_step_end": on_step_end,
+    }
+    if reference_image is not None:
+        pipeline_args["ip_adapter_image"] = prepare_character_reference(reference_image)
     image = pipe(
-        prompt=prompt,
-        negative_prompt=settings["negative_prompt"],
-        width=int(settings["width"]),
-        height=int(settings["height"]),
-        num_inference_steps=steps,
-        guidance_scale=float(settings["cfg"]),
-        clip_skip=int(settings["clip_skip"]),
-        generator=_generator(settings["seed"]),
-        callback_on_step_end=on_step_end,
+        **pipeline_args,
     ).images[0]
     return image
+
+
+def configure_pipeline_reference(
+    pipe,
+    enabled=False,
+    weight=0.25,
+    status_callback=None,
+):
+    """Configure one SDXL IP-Adapter reference without coupling it to LoRA."""
+    loaded = bool(getattr(pipe, "_character_reference_adapter_loaded", False))
+    if not enabled:
+        if loaded:
+            pipe.unload_ip_adapter()
+            pipe._character_reference_adapter_loaded = False
+        return
+
+    if not loaded:
+        repo_id = os.environ.get("IP_ADAPTER_MODEL", "h94/IP-Adapter").strip()
+        subfolder = os.environ.get("IP_ADAPTER_SUBFOLDER", "sdxl_models").strip()
+        weight_name = os.environ.get(
+            "IP_ADAPTER_WEIGHT_NAME",
+            "ip-adapter-plus_sdxl_vit-h.safetensors",
+        ).strip()
+        image_encoder_folder = os.environ.get(
+            "IP_ADAPTER_IMAGE_ENCODER_FOLDER",
+            "models/image_encoder",
+        ).strip()
+        if status_callback:
+            status_callback(
+                "キャラクター参照アダプターを準備しています。初回のみダウンロードします"
+            )
+        pipe.load_ip_adapter(
+            repo_id,
+            subfolder=subfolder,
+            weight_name=weight_name,
+            image_encoder_folder=image_encoder_folder,
+        )
+        pipe._character_reference_adapter_loaded = True
+
+    pipe.set_ip_adapter_scale(max(0.0, min(1.0, float(weight))))
+
+
+def configure_pipeline_loras(pipe, adapters=None):
+    """Load independent Character and Style LoRAs on the shared SDXL pipeline."""
+    try:
+        pipe.unload_lora_weights()
+    except (AttributeError, RuntimeError, ValueError):
+        pass
+    active = [adapter for adapter in (adapters or []) if adapter.get("weights_path")]
+    if not active:
+        return
+    adapter_names = []
+    adapter_weights = []
+    for index, adapter in enumerate(active):
+        path = Path(adapter["weights_path"])
+        if not path.is_file():
+            raise RuntimeError(f"LoRA weights do not exist: {path}")
+        requested_name = str(
+            adapter.get("adapter_name") or f"user_adapter_{index}"
+        )
+        adapter_name = re.sub(r"[^A-Za-z0-9_-]+", "_", requested_name)
+        if adapter_name in adapter_names:
+            adapter_name = f"{adapter_name}_{index}"
+        pipe.load_lora_weights(
+            str(path.parent),
+            weight_name=path.name,
+            adapter_name=adapter_name,
+        )
+        adapter_names.append(adapter_name)
+        adapter_weights.append(float(adapter.get("weight", 1.0)))
+    try:
+        pipe.set_adapters(adapter_names, adapter_weights=adapter_weights)
+    except TypeError:
+        pipe.set_adapters(adapter_names, adapter_weights)
+
+
+def configure_pipeline_lora(pipe, weights_path=None, weight=0.8):
+    """Backward-compatible single-adapter wrapper."""
+    configure_pipeline_loras(
+        pipe,
+        [{
+            "weights_path": weights_path,
+            "weight": weight,
+            "adapter_name": "character_asset",
+        }] if weights_path else [],
+    )

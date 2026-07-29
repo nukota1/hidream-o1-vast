@@ -7,10 +7,12 @@ import json
 import os
 import queue
 import re
+import subprocess
 import tempfile
 import threading
 import traceback
 import uuid
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,11 +27,20 @@ from image_edit_workflows import (
     editor_model_choices,
     extract_plain_background_mask,
     load_editor_pipeline,
-    normalize_plain_background,
     unload_editor,
+)
+from lora_training import (
+    MAX_LORA_IMAGES_BY_CATEGORY,
+    RECOMMENDED_IMAGE_COUNTS,
+    LoraStore,
+    current_model_type,
+    is_lora_compatible,
+    model_type_label,
 )
 from prompt_refiner import LocalPromptRefiner
 from sdxl_janku_workflow import (
+    configure_pipeline_loras,
+    configure_pipeline_reference,
     fit_prompt_for_sdxl,
     generate_with_janku,
     load_janku_pipeline,
@@ -38,6 +49,9 @@ from sdxl_janku_workflow import (
 load_dotenv()
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = int(
+    os.environ.get("MAX_REQUEST_BYTES", str(512 * 1024 * 1024))
+)
 BACKEND_SHARED_SECRET = os.environ.get("BACKEND_SHARED_SECRET", "").strip()
 
 
@@ -53,8 +67,10 @@ def require_backend_shared_secret():
 
 _GEN_LOCK = threading.Lock()
 _JOBS = {}
+_LORA_JOBS = {}
 _STATE = {
     "janku_pipe": None,
+    "lora_signature": (),
     "editor_pipe": None,
     "editor_id": None,
     "refiner": LocalPromptRefiner(),
@@ -64,9 +80,10 @@ _PROMPT_CATALOG = None
 IMAGE_MODEL_FAMILY = os.environ.get("IMAGE_MODEL_FAMILY", "janku").strip().lower()
 IMAGE_MODEL_LABEL = os.environ.get(
     "IMAGE_MODEL_LABEL",
-    "Animagine XL 4.0 Opt" if IMAGE_MODEL_FAMILY == "animagine" else "JANKU v7.77",
+    "Animagine XL 4.0 Zero" if IMAGE_MODEL_FAMILY == "animagine" else "JANKU v7.77",
 )
 APP_NAME = os.environ.get("APP_NAME", "Animagine Image Studio" if IMAGE_MODEL_FAMILY == "animagine" else "JANKU Image Studio")
+LORA_STORE = LoraStore()
 
 BASE_NEGATIVE_PROMPT = (
     "lowres, worst quality, low quality, bad anatomy, bad hands, extra fingers, "
@@ -110,6 +127,8 @@ BACKGROUNDLESS_NEGATIVE_TAGS = (
 CHARACTER_REQUIRED_TAGS = (
     "solo",
     "simple white background",
+    "plain background",
+    "isolated",
 )
 CHARACTER_NEGATIVE_TAGS = (
     *BACKGROUNDLESS_NEGATIVE_TAGS,
@@ -119,7 +138,9 @@ CHARACTER_NEGATIVE_TAGS = (
     "environmental effects",
     "gradient background",
     "gray background",
-    "coloured background",
+    "green background",
+    "red background",
+    "blue background",
     "geometric background",
     "studio backdrop",
     "floor",
@@ -437,6 +458,10 @@ def join_unique_tags(*groups):
     return ", ".join(tags)
 
 
+def split_prompt_tags(prompt):
+    return [tag.strip() for tag in re.split(r"[,\n]", str(prompt)) if tag.strip()]
+
+
 def background_suppression_requested(user_prompt, mode):
     """Treat an explicit no-background request as composition, not style."""
     if mode != "t2i":
@@ -529,10 +554,13 @@ def stabilize_character_eye_tags(tags):
     normalized = []
     detected_color = ""
     eye_requested = False
+    eye_insert_index = None
     for raw_tag in tags:
         tag = raw_tag.strip()
         value = tag.lower()
         if "eye" in value or "iris" in value:
+            if eye_insert_index is None:
+                eye_insert_index = len(normalized)
             for color in eye_colors:
                 if re.search(rf"\b{re.escape(color)}\b", value):
                     detected_color = "red" if color == "crimson" else (
@@ -561,12 +589,13 @@ def stabilize_character_eye_tags(tags):
         ]
         stable = [color_tag] if color_tag else []
         stable.extend(("gradient eyes", "eye highlights"))
-        normalized = [*stable, *normalized]
+        insert_at = min(eye_insert_index or 0, len(normalized))
+        normalized[insert_at:insert_at] = stable
     return normalized
 
 
 def apply_character_constraints(prompt_info, settings):
-    """Keep the character workflow to one character on white without forcing a pose."""
+    """Keep one standalone character on a neutral background without a matte."""
     quality_tags = ["masterpiece", "high score", "great score", "absurdres"]
     preset = STYLE_PRESETS[settings["preset"]]
     style_control_tags = style_adjustment_tags(settings["style"], preset["style"])
@@ -613,7 +642,7 @@ def apply_character_constraints(prompt_info, settings):
     )
     prompt_info["intent_notes"] = (
         f"{prompt_info.get('intent_notes', '')} Character workflow enforced: "
-        "single character on a plain white background; requested pose and framing preserved."
+        "single character on a simple white background; no silhouette mask is generated."
     ).strip()
     return prompt_info
 
@@ -805,6 +834,28 @@ def background_inpaint_prompt(prompt):
         tag = tag.strip()
         if tag and not subject_terms.search(tag):
             environment_tags.append(tag)
+    layout_defaults = [
+        "visual novel background",
+        "clear foreground space",
+        "open center foreground",
+        "unobstructed lower center",
+        "floor visible at bottom center",
+        "empty central aisle extending to bottom edge",
+    ]
+    camera_terms = (
+        "aerial view", "bird's-eye view", "birds-eye view", "top-down",
+        "overhead view", "low angle", "high angle", "worm's-eye view",
+        "worms-eye view", "dutch angle",
+    )
+    if not any(term in prompt.lower() for term in camera_terms):
+        layout_defaults.extend([
+            "eye-level view",
+            "ground-level camera",
+            "straight-on view",
+            "central perspective",
+            "horizon at mid-height",
+            "clear ground plane in foreground",
+        ])
     return join_unique_tags(
         environment_tags,
         (
@@ -813,6 +864,27 @@ def background_inpaint_prompt(prompt):
             "matching scene lighting",
             "empty background without people",
         ),
+        layout_defaults,
+    )
+
+
+def background_prompt_requests_subject_change(prompt):
+    """Return whether a background-only request also asks to change the subject."""
+    value = str(prompt or "")
+    japanese_subject_change = re.compile(
+        r"(?:ポーズ|姿勢|表情|顔元|顔つき|髪型|衣装|服装|"
+        r"ピース|手を|腕を|脚を|足を)|"
+        r"(?:人物|キャラクター).{0,8}(?:変更|削除|消去|変え|直し|修正)"
+    )
+    english_subject_change = re.compile(
+        r"\b(?:pose|posing|gesture|peace sign|facial expression|"
+        r"hairstyle|outfit|clothing|raise (?:her|his|their) hand|"
+        r"move (?:her|his|their) (?:hand|arm|leg))\b",
+        re.IGNORECASE,
+    )
+    return bool(
+        japanese_subject_change.search(value)
+        or english_subject_change.search(value)
     )
 
 
@@ -831,6 +903,7 @@ def apply_event_character_lock(prompt_info, locked_character_prompt, settings):
     layout_only = {
         "simple white background", "plain background",
         "pure white background", "white background", "isolated",
+        "simple green background", "solid green background", "green background",
     }
     locked_tags = []
     for raw_tag in re.split(r"[,\n]", locked_character_prompt):
@@ -876,10 +949,333 @@ def apply_event_character_lock(prompt_info, locked_character_prompt, settings):
     return prompt_info
 
 
-def prepare_prompt(user_prompt, mode, settings, refine_enabled, workflow=WORKFLOW_CHARACTER):
+def build_consistent_story_prompt(character_info, scene_info, settings):
+    """Merge separately refined identity and scene conditions in priority order."""
+    raw_character_tags = [
+        tag.strip()
+        for tag in re.split(r"[,\n]", character_info["prompt"])
+        if tag.strip()
+    ]
+    hair_pattern = re.compile(
+        r"^(pink|blue|red|blonde|black|brown|white|silver|purple|green)\s+"
+        r"(short|long|medium(?: length)?)\s+hair$",
+        re.IGNORECASE,
+    )
+    character_tags = []
+    for tag in raw_character_tags:
+        match = hair_pattern.match(tag)
+        if match:
+            character_tags.extend((
+                f"{match.group(1).lower()} hair",
+                f"{match.group(2).lower()} hair",
+            ))
+        else:
+            character_tags.append(tag)
+    character_text = ", ".join(character_tags).lower()
+    has_subject_count = bool(re.search(
+        r"(?:^|,\s*)(?:[1-9](?:girl|boy)s?|multiple (?:girls|boys)|group)(?:,|$)",
+        character_text,
+    ))
+    if not has_subject_count:
+        if any(term in character_text for term in ("girl", "female", "woman")):
+            character_tags = ["1girl", "solo", *character_tags]
+        elif any(term in character_text for term in ("boy", "male", "man")):
+            character_tags = ["1boy", "solo", *character_tags]
+    locked_character_prompt = join_unique_tags(character_tags)
+    merged = apply_event_character_lock(
+        {
+            "prompt": scene_info["prompt"],
+            "intent_notes": scene_info.get("intent_notes", ""),
+            "source": scene_info.get("source", ""),
+        },
+        locked_character_prompt,
+        settings,
+    )
+    merged["intent_notes"] = " ".join(
+        value
+        for value in (
+            character_info.get("intent_notes", ""),
+            scene_info.get("intent_notes", ""),
+            "Character identity and scene were refined separately; identity tags were placed first.",
+        )
+        if value
+    )
+    character_source = character_info.get("source", "")
+    scene_source = scene_info.get("source", "")
+    merged["source"] = (
+        character_source
+        if character_source == scene_source
+        else " + ".join(value for value in (character_source, scene_source) if value)
+    )
+    merged["character_prompt"] = locked_character_prompt
+    merged["scene_prompt"] = scene_info["prompt"]
+    return merged
+
+
+def prioritize_consistent_story_tags(prompt_info):
+    """Keep immutable identity and requested action ahead of optional styling."""
+    tags = [
+        tag.strip()
+        for tag in re.split(r"[,\n]", prompt_info["prompt"])
+        if tag.strip()
+    ]
+
+    def priority(tag):
+        value = tag.lower()
+        if re.fullmatch(r"(?:[1-9](?:girl|boy)s?|solo|multiple (?:girls|boys)|group)", value):
+            return 0
+        if any(term in value for term in (
+            "hair", "bun", "updo", "ponytail", "twintail", "braid",
+            "eyes", "eye color", "face", "facial", "skin", "freckles", "mole",
+            "petite", "short stature", "small frame", "body type", "proportions", "youthful",
+            "tall stature", "hair clip", "hairpin",
+        )):
+            return 1
+        if any(term in value for term in (
+            "peace sign", "v sign", "(v:", "v over eye", "hand beside face", "two fingers",
+            "one hand raised", "standing", "sitting", "kneeling", "crouching",
+            "lying", "running", "jumping", "waving", "looking at viewer",
+            "full body", "upper body", "portrait", "from behind", "back view",
+            "profile", "smile", "expression", "arms ", "hands ",
+        )):
+            return 2
+        if any(term in value for term in (
+            "female student", "male student", "school uniform",
+            "uniform", "outfit", "dress", "shirt", "skirt", "jacket", "ribbon",
+            "shorts", "pants", "shoes", "boots", "socks", "stockings",
+            "accessory",
+        )):
+            return 3
+        if any(term in value for term in (
+            "visual novel", "anime illustration", "lineart", "line art",
+            "shading", "rendering", "lighting", "pastel colors",
+            "vivid colors", "highly detailed", "intricate details",
+        )):
+            return 5
+        if any(term in value for term in (
+            "masterpiece", "high score", "great score", "absurdres",
+        )):
+            return 6
+        return 4
+
+    prompt_info["prompt"] = join_unique_tags(
+        sorted(tags, key=priority),
+    )
+    return prompt_info
+
+
+def apply_source_scene_exclusion(settings, source_scene_prompt, target_scene_prompt):
+    """Keep a reference image's old setting from overpowering the new scene."""
+    source_tags = [
+        tag.strip()
+        for tag in re.split(r"[,\n]", str(source_scene_prompt or ""))
+        if tag.strip()
+    ]
+    target_tags = {
+        tag.strip().lower()
+        for tag in re.split(r"[,\n]", str(target_scene_prompt or ""))
+        if tag.strip()
+    }
+    protected_terms = (
+        "girl",
+        "boy",
+        "character",
+        "hair",
+        "eyes",
+        "face",
+        "skin",
+        "body",
+        "outfit",
+        "uniform",
+        "dress",
+        "shirt",
+        "skirt",
+        "jacket",
+        "shoes",
+        "boots",
+        "accessory",
+        "ribbon",
+        "smile",
+        "smiling",
+        "expression",
+        "looking",
+        "pose",
+        "hand",
+        "standing",
+        "sitting",
+        "full body",
+        "upper body",
+        "masterpiece",
+        "high score",
+        "great score",
+        "absurdres",
+    )
+    exclusions = [
+        tag
+        for tag in source_tags
+        if tag.lower() not in target_tags
+        and not any(term in tag.lower() for term in protected_terms)
+    ]
+    if exclusions:
+        settings["negative_prompt"] = join_unique_tags(
+            settings["negative_prompt"].split(","),
+            exclusions,
+        )
+    return exclusions
+
+
+def apply_lora_leakage_constraints(settings, requested_prompt, lora_metadata):
+    """Suppress dataset constants unless the current request explicitly asks for them."""
+    raw_tags = (lora_metadata or {}).get("training_leakage_tags") or []
+    if isinstance(raw_tags, str):
+        raw_tags = split_prompt_tags(raw_tags)
+    fixed_exclusions = split_prompt_tags(
+        (lora_metadata or {}).get("identity_negative_prompt") or ""
+    )
+    raw_tags = [*raw_tags, *fixed_exclusions]
+    requested = str(requested_prompt or "").lower()
+    exclusions = []
+    for value in raw_tags:
+        tag = str(value or "").strip()
+        if not tag or tag.lower() in requested:
+            continue
+        exclusions.append(tag)
+    if exclusions:
+        settings["negative_prompt"] = join_unique_tags(
+            split_prompt_tags(settings.get("negative_prompt", "")),
+            exclusions,
+        )
+    return exclusions
+
+
+def apply_background_replacement_constraints(prompt_info, original_prompt, settings):
+    """Strengthen explicit whole-background replacements for tag-based SDXL."""
+    value = str(original_prompt or "")
+    replaces_background = bool(re.search(
+        r"(?:背景|background).{0,24}(?:変更|変えて|置き換|replace|change)",
+        value,
+        re.IGNORECASE,
+    ))
+    requests_ocean = bool(re.search(
+        r"(?:海|海辺|浜辺|ビーチ|\bocean\b|\bsea\b|\bbeach\b)",
+        value,
+        re.IGNORECASE,
+    ))
+    if not requests_ocean:
+        return prompt_info
+
+    existing_tags = [
+        tag.strip()
+        for tag in re.split(r"[,\n]", prompt_info["prompt"])
+        if tag.strip()
+    ]
+    ocean_tags = (
+        "(outdoors:1.2)",
+        "(open ocean:1.3)",
+        "(ocean horizon:1.2)",
+        "blue sea visible in background",
+        "blue sky",
+    )
+    if replaces_background:
+        ocean_tags = (
+            "(outdoors:1.2)",
+            "sandy beach",
+            "(open ocean:1.3)",
+            "(ocean horizon:1.2)",
+            "blue sea visible in background",
+            "blue sky",
+        )
+    prompt_info["prompt"] = join_unique_tags(ocean_tags, existing_tags)
+    settings["negative_prompt"] = join_unique_tags(
+        settings["negative_prompt"].split(","),
+        (
+            "indoors",
+            "interior",
+        ),
+    )
+    if replaces_background:
+        settings["negative_prompt"] = join_unique_tags(
+            settings["negative_prompt"].split(","),
+            (
+                "classroom",
+                "school desk",
+                "window",
+                "window frame",
+            ),
+        )
+        prompt_info["intent_notes"] = (
+            f"{prompt_info.get('intent_notes', '')} Explicit ocean background replacement "
+            "was expanded into an outdoor beach setting and indoor remnants were excluded."
+        ).strip()
+    else:
+        prompt_info["intent_notes"] = (
+            f"{prompt_info.get('intent_notes', '')} The requested ocean was prioritized "
+            "as a visible outdoor background."
+        ).strip()
+    return prompt_info
+
+
+def apply_event_instruction_constraints(prompt_info, original_prompt, settings):
+    """Stabilize explicit event-CG gestures that a single refined tag may miss."""
+    value = str(original_prompt or "")
+    requests_peace_sign = bool(re.search(
+        r"(?:ピース|Vサイン|\bpeace sign\b|\bv sign\b)",
+        value,
+        re.IGNORECASE,
+    ))
+    if not requests_peace_sign:
+        return prompt_info
+
+    existing_tags = [
+        tag.strip()
+        for tag in re.split(r"[,\n]", prompt_info["prompt"])
+        if tag.strip()
+    ]
+    prompt_info["prompt"] = join_unique_tags(
+        (
+            "(v over eye:1.4)",
+            "(v:1.3)",
+            "peace sign",
+            "hand beside face",
+        ),
+        existing_tags,
+    )
+    settings["negative_prompt"] = join_unique_tags(
+        settings["negative_prompt"].split(","),
+        (
+            "hands under chin",
+            "both hands on cheeks",
+            "clasped hands",
+            "hidden hands",
+            "shushing",
+            "finger to lips",
+            "single raised finger",
+            "index finger raised",
+            "finger to cheek",
+            "fingers to cheeks",
+            "poking cheeks",
+            "hands on cheeks",
+        ),
+    )
+    prompt_info["intent_notes"] = (
+        f"{prompt_info.get('intent_notes', '')} Explicit face-level peace-sign gesture "
+        "was expanded into model-facing pose tags."
+    ).strip()
+    return prompt_info
+
+
+def prepare_prompt(
+    user_prompt,
+    mode,
+    settings,
+    refine_enabled,
+    workflow=WORKFLOW_CHARACTER,
+    supplemental_prompt="",
+):
     preset = STYLE_PRESETS[settings["preset"]]
     adjustment_tags = style_adjustment_tags(settings["style"], preset["style"]) if mode == "t2i" else []
     preset_style_tags = preset.get("positive_style_tags", []) if mode == "t2i" else []
+    supplemental_tags = split_prompt_tags(supplemental_prompt)
     # A broad preset is useful guidance, but detailed preset prose must not
     # displace the user's concrete visual requirements in SDXL's CLIP window.
     refiner_preset_hint = preset["prompt_hint"] if mode == "t2i" else "preserve source image style"
@@ -906,20 +1302,27 @@ def prepare_prompt(user_prompt, mode, settings, refine_enabled, workflow=WORKFLO
                     tags = [tag for tag in tags if tag.lower() not in {item.lower() for item in quality}]
                     refined["prompt"] = join_unique_tags(
                         tags,
+                        supplemental_tags,
                         adjustment_tags,
                         preset_style_tags,
                         quality,
                     )
                 else:
                     refined["prompt"] = join_unique_tags(
-                        preset_style_tags,
-                        adjustment_tags,
                         refined["prompt"].split(","),
+                        supplemental_tags,
+                        adjustment_tags,
+                        preset_style_tags,
                     )
                 refined["intent_notes"] = (
                     f"{refined.get('intent_notes', '')} Applied style controls: "
                     f"{', '.join([*preset_style_tags, *adjustment_tags])}."
                 ).strip()
+            elif supplemental_tags:
+                refined["prompt"] = join_unique_tags(
+                    refined["prompt"].split(","),
+                    supplemental_tags,
+                )
             return refined
         except Exception as exc:
             print(f"[refine] Local refinement failed: {exc}")
@@ -938,6 +1341,7 @@ def prepare_prompt(user_prompt, mode, settings, refine_enabled, workflow=WORKFLO
         ]
         prompt = join_unique_tags(
             user_tags,
+            supplemental_tags,
             adjustment_tags,
             preset_style_tags,
             quality,
@@ -945,6 +1349,8 @@ def prepare_prompt(user_prompt, mode, settings, refine_enabled, workflow=WORKFLO
         return {"prompt": prompt, "intent_notes": notes, "source": source}
 
     parts = [user_prompt]
+    if supplemental_prompt:
+        parts.append(supplemental_prompt)
     parts.extend(preset_style_tags)
     if preset["prompt_hint"] and not preset_style_tags:
         parts.append(preset["prompt_hint"])
@@ -957,6 +1363,8 @@ def prepare_prompt(user_prompt, mode, settings, refine_enabled, workflow=WORKFLO
 def unload_pipeline(name):
     pipe = _STATE.get(name)
     _STATE[name] = None
+    if name == "janku_pipe":
+        _STATE["lora_signature"] = ()
     if pipe is not None:
         for method_name in ("maybe_free_model_hooks", "remove_all_hooks"):
             try:
@@ -1037,6 +1445,96 @@ def decode_image_to_temp(image_b64, prefix):
     return path
 
 
+def decode_image_payload(image_b64):
+    if image_b64.startswith("data:image"):
+        image_b64 = image_b64.split(",", 1)[1]
+    try:
+        image_bytes = base64.b64decode(image_b64, validate=True)
+        return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception as exc:
+        raise ValueError("参照画像を読み込めませんでした。") from exc
+
+
+def request_owner_id():
+    return str(request.headers.get("X-App-User-Id") or "local").strip() or "local"
+
+
+def public_lora(metadata):
+    item = LORA_STORE.public(metadata)
+    item["compatible"] = is_lora_compatible(metadata)
+    return item
+
+
+def configure_requested_loras(pipe, requested):
+    signature = tuple(
+        (
+            item["metadata"]["id"],
+            round(float(item["weight"]), 3),
+            item["adapter_name"],
+        )
+        for item in requested
+        if item.get("metadata")
+    )
+    if _STATE.get("lora_signature") == signature:
+        return
+    adapters = []
+    for item in requested:
+        metadata = item.get("metadata")
+        if not metadata:
+            continue
+        adapters.append({
+            "weights_path": LORA_STORE.weight_path(
+                metadata["_owner_id"],
+                metadata["id"],
+            ),
+            "weight": round(float(item["weight"]), 3),
+            "adapter_name": item["adapter_name"],
+        })
+    configure_pipeline_loras(pipe, adapters)
+    _STATE["lora_signature"] = signature
+
+
+def read_requested_lora(owner_id, model_id, category):
+    if not model_id:
+        return None
+    try:
+        metadata = LORA_STORE.read(owner_id, model_id)
+    except KeyError as exc:
+        raise ValueError("選択したLoRAが見つかりません。") from exc
+    if metadata.get("status") != "ready":
+        raise RuntimeError(
+            "選択したLoRAはまだ学習中、または学習に失敗しています。"
+        )
+    if not is_lora_compatible(metadata):
+        raise TypeError(
+            "選択したLoRAは現在の基盤モデルと互換性がありません。"
+        )
+    if metadata.get("category") != category:
+        raise ValueError(
+            f"選択したLoRAは{category}カテゴリではありません。"
+        )
+    metadata["_owner_id"] = owner_id
+    return metadata
+
+
+def insert_lora_triggers(prompt, character_trigger="", style_trigger=""):
+    """Follow Animagine ordering: subject, character identity, then style."""
+    tags = [tag.strip() for tag in str(prompt or "").split(",") if tag.strip()]
+    subject_tags = []
+    remaining = []
+    for tag in tags:
+        if not remaining and tag.lower() in {"1girl", "1boy", "1other", "solo"}:
+            subject_tags.append(tag)
+        else:
+            remaining.append(tag)
+    return join_unique_tags(
+        subject_tags,
+        (character_trigger,) if character_trigger else (),
+        (style_trigger,) if style_trigger else (),
+        remaining,
+    )
+
+
 @app.route("/")
 def index():
     refine_default = os.environ.get("PROMPT_REFINE_DEFAULT", "1").lower() not in {"0", "false", "no", "off"}
@@ -1077,12 +1575,179 @@ def api_prompt_catalog():
         return jsonify({"error": f"Prompt catalog could not be loaded: {exc}"}), 500
 
 
+@app.route("/api/lora/models")
+def api_lora_models():
+    owner_id = request_owner_id()
+    return jsonify({
+        "items": [public_lora(item) for item in LORA_STORE.list(owner_id)],
+        "current_model_type": current_model_type(),
+        "current_model_label": model_type_label(),
+        "cuda_available": torch.cuda.is_available(),
+        "recommended_image_counts": RECOMMENDED_IMAGE_COUNTS,
+        "max_image_counts": MAX_LORA_IMAGES_BY_CATEGORY,
+    })
+
+
+@app.route("/api/lora/train/start", methods=["POST"])
+def api_lora_train_start():
+    owner_id = request_owner_id()
+    try:
+        metadata = LORA_STORE.create(owner_id, request.get_json(force=True) or {})
+    except (ValueError, KeyError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"error": f"学習データを準備できませんでした: {exc}"}), 500
+
+    job_id = uuid.uuid4().hex
+    q = queue.Queue()
+    _LORA_JOBS[job_id] = q
+
+    def worker():
+        model_id = metadata["id"]
+        recent_output = deque(maxlen=16)
+        try:
+            LORA_STORE.update(owner_id, model_id, status="training", progress=0, error="")
+            q.put({
+                "type": "status",
+                "phase": "training",
+                "message": "推論モデルを解放し、LoRA学習を準備しています",
+            })
+            with _GEN_LOCK:
+                _STATE["refiner"].unload_if_cuda()
+                unload_pipeline("janku_pipe")
+                unload_active_editor()
+                command = LORA_STORE.training_command(owner_id, model_id)
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                )
+                last_progress = -1
+                for raw_line in process.stdout or ():
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    recent_output.append(line)
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    event_type = event.get("type")
+                    if event_type == "progress":
+                        step = int(event.get("step") or 0)
+                        total = max(1, int(event.get("total") or metadata["steps"]))
+                        percent = min(99, round(step / total * 100))
+                        if percent != last_progress:
+                            LORA_STORE.update(
+                                owner_id,
+                                model_id,
+                                progress=percent,
+                                last_loss=event.get("loss"),
+                            )
+                            last_progress = percent
+                        q.put(event)
+                    elif event_type == "status":
+                        q.put({
+                            "type": "status",
+                            "phase": "training",
+                            "message": str(event.get("message") or "LoRAを学習しています"),
+                        })
+                return_code = process.wait()
+                weight_path = LORA_STORE.weight_path(owner_id, model_id)
+                if return_code != 0 or not weight_path.is_file():
+                    tail = "\n".join(recent_output)
+                    raise RuntimeError(
+                        "LoRA学習プロセスが失敗しました。"
+                        + (f"\n{tail[-2000:]}" if tail else "")
+                    )
+            completed = LORA_STORE.update(
+                owner_id,
+                model_id,
+                status="ready",
+                progress=100,
+                completed_at=datetime.now(timezone.utc).isoformat(),
+                error="",
+            )
+            q.put({"type": "done", "model": public_lora(completed)})
+        except Exception as exc:
+            traceback.print_exc()
+            failed = LORA_STORE.update(
+                owner_id,
+                model_id,
+                status="failed",
+                error=str(exc)[-2000:],
+            )
+            q.put({
+                "type": "error",
+                "message": str(exc),
+                "model": public_lora(failed),
+            })
+        finally:
+            q.put(None)
+
+    threading.Thread(target=worker, daemon=True).start()
+    return jsonify({"job_id": job_id, "model": public_lora(metadata)})
+
+
+@app.route("/api/lora/train/stream/<job_id>")
+def api_lora_train_stream(job_id):
+    q = _LORA_JOBS.get(job_id)
+    if q is None:
+        return jsonify({"error": "Unknown LoRA training job"}), 404
+
+    def generate_events():
+        try:
+            while True:
+                item = q.get()
+                if item is None:
+                    break
+                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+        finally:
+            _LORA_JOBS.pop(job_id, None)
+
+    return Response(
+        generate_events(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.route("/api/generate/start", methods=["POST"])
 def api_generate_start():
     data = request.get_json(force=True)
-    prompt = str(data.get("prompt") or "").strip()
+    free_prompt = str(data.get("free_prompt") or "").strip()[:5000]
+    catalog_prompt = str(data.get("catalog_prompt") or "").strip()[:5000]
+    prompt = str(
+        data.get("prompt")
+        or "\n".join(value for value in (free_prompt, catalog_prompt) if value)
+    ).strip()
     mode = str(data.get("mode") or "t2i")
     workflow = str(data.get("workflow") or WORKFLOW_CHARACTER)
+    character_prompt = str(data.get("character_prompt") or "").strip()[:5000]
+    scene_prompt = str(data.get("scene_prompt") or "").strip()[:5000]
+    source_scene_prompt = str(data.get("source_scene_prompt") or "").strip()[:5000]
+    generation_intent = str(data.get("generation_intent") or "").strip()
+    if not generation_intent:
+        if mode == "edit":
+            generation_intent = "manual_edit"
+        elif workflow == WORKFLOW_COMPOSE:
+            generation_intent = "consistent_regeneration"
+        elif scene_prompt:
+            generation_intent = "story_illustration"
+        else:
+            generation_intent = "character_asset"
+    if generation_intent not in {
+        "character_asset",
+        "story_illustration",
+        "consistent_regeneration",
+        "manual_edit",
+    }:
+        return jsonify({"error": f"Unknown generation intent: {generation_intent}"}), 400
     if not prompt:
         return jsonify({"error": "プロンプトを入力してください。"}), 400
     if mode not in {"t2i", "edit"}:
@@ -1093,23 +1758,92 @@ def api_generate_start():
         return jsonify({"error": "Character workflow must use text-to-image generation."}), 400
     if workflow == WORKFLOW_COMPOSE and mode not in {"edit", "t2i"}:
         return jsonify({"error": "Compose workflow must use image editing or integrated generation."}), 400
+    if workflow == WORKFLOW_CHARACTER and not character_prompt:
+        character_prompt = prompt
+    if mode == "t2i" and generation_intent in {
+        "story_illustration",
+        "consistent_regeneration",
+    } and not character_prompt:
+        return jsonify({"error": "保持するキャラクター定義を入力してください。"}), 400
+    if generation_intent == "story_illustration" and not scene_prompt:
+        return jsonify({"error": "一枚絵として生成する背景・シーンを入力してください。"}), 400
     source_image = str(data.get("source_image") or "").strip()
     if mode == "edit" and not source_image:
         return jsonify({"error": "編集元の画像が必要です。"}), 400
+    reference_image_b64 = str(data.get("reference_image") or "").strip()
+    reference_strength = clamp_float(
+        data.get("reference_strength"),
+        float(os.environ.get("IP_ADAPTER_DEFAULT_SCALE", "0.25")),
+        0.0,
+        1.0,
+    )
 
     settings = normalize_generation_settings(data)
     refine_enabled = bool(data.get("refine_enabled", True))
-    lock_character_outfit = bool(data.get("lock_character_outfit", False))
-    locked_character_prompt = str(data.get("locked_character_prompt") or "").strip()[:5000]
+    lock_character_outfit = bool(data.get(
+        "lock_character_outfit",
+        generation_intent in {"story_illustration", "consistent_regeneration"},
+    ))
+    locked_character_prompt = str(
+        data.get("locked_character_prompt") or character_prompt
+    ).strip()[:5000]
     mask_b64 = str(data.get("mask_image") or "").strip()
     background_mask_b64 = str(data.get("background_mask_image") or "").strip()
     edit_strength = clamp_float(data.get("edit_strength"), 0.55, 0.10, 0.95)
     edit_scope = str(data.get("edit_scope") or "background")
     if edit_scope not in {"background", "full"}:
         return jsonify({"error": f"Unknown edit scope: {edit_scope}"}), 400
+    if (
+        workflow == WORKFLOW_COMPOSE
+        and mode == "edit"
+        and edit_scope == "background"
+        and background_prompt_requests_subject_change(prompt)
+    ):
+        return jsonify({
+            "error": (
+                "「立ち絵を保持して背景だけ変更」では人物ピクセルを固定するため、"
+                "ポーズ・表情・衣装は変更できません。"
+                "「ポーズ・構図を含めてイベントCGを再生成」を選択してください。"
+            )
+        }), 400
     editor_id = str(data.get("editor_model") or "waifu_inpaint_xl")
     if mode == "edit" and editor_id not in EDITOR_MODELS:
         return jsonify({"error": f"Unknown image editor: {editor_id}"}), 400
+    owner_id = request_owner_id()
+    selected_character_lora = None
+    selected_style_lora = None
+    character_lora_id = str(
+        data.get("character_lora_id") or data.get("lora_id") or ""
+    ).strip()
+    style_lora_id = str(data.get("style_lora_id") or "").strip()
+    character_lora_weight = clamp_float(
+        data.get("character_lora_weight", data.get("lora_weight")),
+        0.8,
+        0.0,
+        1.5,
+    )
+    style_lora_weight = clamp_float(
+        data.get("style_lora_weight"),
+        0.6,
+        0.0,
+        1.5,
+    )
+    if mode == "t2i":
+        try:
+            selected_character_lora = read_requested_lora(
+                owner_id,
+                character_lora_id,
+                "character",
+            )
+            selected_style_lora = read_requested_lora(
+                owner_id,
+                style_lora_id,
+                "style",
+            )
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 409
+        except (TypeError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 400
     job_id = uuid.uuid4().hex
     q = queue.Queue()
     _JOBS[job_id] = q
@@ -1119,23 +1853,110 @@ def api_generate_start():
         generated_background_mask = ""
         try:
             q.put({"type": "status", "phase": "refine", "message": "プロンプトを準備しています"})
-            prompt_workflow = (
-                ("event_scene" if lock_character_outfit and locked_character_prompt else "event_cg")
-                if workflow == WORKFLOW_COMPOSE and mode == "t2i"
-                else (
+            lora_identity_prompt = (
+                str(selected_character_lora.get("identity_prompt") or "").strip()
+                if selected_character_lora
+                else ""
+            )
+            effective_character_prompt = character_prompt
+            if lora_identity_prompt and mode == "t2i":
+                effective_character_prompt = "\n".join(
+                    value
+                    for value in (lora_identity_prompt, character_prompt)
+                    if value
+                )
+            priority_prompt = free_prompt or prompt
+            supplemental_prompt = catalog_prompt if free_prompt else ""
+            optimized_character_prompt = ""
+            optimized_scene_prompt = ""
+            uses_separated_story_prompt = (
+                mode == "t2i"
+                and generation_intent in {
+                    "story_illustration",
+                    "consistent_regeneration",
+                }
+            )
+            if (
+                lora_identity_prompt
+                and mode == "t2i"
+                and not uses_separated_story_prompt
+            ):
+                priority_prompt = "\n".join(
+                    value
+                    for value in (lora_identity_prompt, priority_prompt)
+                    if value
+                )
+            if uses_separated_story_prompt:
+                character_supplemental = (
+                    supplemental_prompt if workflow == WORKFLOW_CHARACTER else ""
+                )
+                scene_supplemental = (
+                    supplemental_prompt if workflow == WORKFLOW_COMPOSE else ""
+                )
+                scene_request = (
+                    scene_prompt
+                    if generation_intent == "story_illustration"
+                    else priority_prompt
+                )
+                character_info = prepare_prompt(
+                    effective_character_prompt,
+                    "t2i",
+                    settings,
+                    refine_enabled,
+                    workflow="story_character",
+                    supplemental_prompt=character_supplemental,
+                )
+                scene_info = prepare_prompt(
+                    scene_request,
+                    "t2i",
+                    settings,
+                    refine_enabled,
+                    workflow="story_scene",
+                    supplemental_prompt=scene_supplemental,
+                )
+                prompt_info = build_consistent_story_prompt(
+                    character_info,
+                    scene_info,
+                    settings,
+                )
+                optimized_character_prompt = character_info["prompt"]
+                optimized_scene_prompt = scene_info["prompt"]
+                if (
+                    generation_intent == "consistent_regeneration"
+                    and source_scene_prompt
+                ):
+                    excluded_scene_tags = apply_source_scene_exclusion(
+                        settings,
+                        source_scene_prompt,
+                        optimized_scene_prompt,
+                    )
+                    if excluded_scene_tags:
+                        prompt_info["intent_notes"] = (
+                            f"{prompt_info.get('intent_notes', '')} "
+                            "Previous-scene tags were added to the negative prompt so the "
+                            "reference image supplies character identity without restoring "
+                            "its old background."
+                        ).strip()
+            else:
+                prompt_workflow = (
                     "compose_background"
                     if workflow == WORKFLOW_COMPOSE and edit_scope == "background"
                     else workflow
                 )
-            )
-            prompt_info = prepare_prompt(
-                prompt, mode, settings, refine_enabled, workflow=prompt_workflow
-            )
-            if workflow == WORKFLOW_CHARACTER:
+                prompt_info = prepare_prompt(
+                    priority_prompt,
+                    mode,
+                    settings,
+                    refine_enabled,
+                    workflow=prompt_workflow,
+                    supplemental_prompt=supplemental_prompt,
+                )
+            if workflow == WORKFLOW_CHARACTER and not uses_separated_story_prompt:
                 prompt_info = apply_character_constraints(prompt_info, settings)
             elif (
                 workflow == WORKFLOW_COMPOSE
                 and mode == "t2i"
+                and not uses_separated_story_prompt
                 and lock_character_outfit
                 and locked_character_prompt
             ):
@@ -1154,6 +1975,92 @@ def api_generate_start():
                 ).strip()
             elif background_suppression_requested(prompt, mode):
                 prompt_info = apply_background_suppression(prompt_info, settings)
+            if mode == "t2i" and generation_intent in {
+                "story_illustration",
+                "consistent_regeneration",
+            }:
+                prompt_info = apply_background_replacement_constraints(
+                    prompt_info,
+                    "\n".join(
+                        value
+                        for value in (scene_prompt, prompt)
+                        if value
+                    ),
+                    settings,
+                )
+                prompt_info = apply_event_instruction_constraints(
+                    prompt_info,
+                    "\n".join(
+                        value
+                        for value in (character_prompt, scene_prompt, prompt)
+                        if value
+                    ),
+                    settings,
+                )
+                prompt_info = prioritize_consistent_story_tags(prompt_info)
+            if (
+                selected_character_lora or selected_style_lora
+            ) and mode == "t2i":
+                prompt_info["prompt"] = insert_lora_triggers(
+                    prompt_info["prompt"],
+                    (
+                        selected_character_lora["trigger_word"]
+                        if selected_character_lora
+                        else ""
+                    ),
+                    (
+                        selected_style_lora["trigger_word"]
+                        if selected_style_lora
+                        else ""
+                    ),
+                )
+                request_text = "\n".join(
+                    value
+                    for value in (character_prompt, scene_prompt, prompt)
+                    if value
+                )
+                leakage_exclusions = []
+                if selected_character_lora:
+                    leakage_exclusions.extend(apply_lora_leakage_constraints(
+                        settings,
+                        request_text,
+                        selected_character_lora,
+                    ))
+                    prompt_info["intent_notes"] = (
+                        f"{prompt_info.get('intent_notes', '')} "
+                        f"Character LoRA: {selected_character_lora['name']} "
+                        f"({selected_character_lora['trigger_word']}, "
+                        f"weight {character_lora_weight:.2f})."
+                    ).strip()
+                    if lora_identity_prompt:
+                        prompt_info["intent_notes"] = (
+                            f"{prompt_info['intent_notes']} "
+                            "The LoRA fixed identity profile was applied before scene styling."
+                        )
+                if selected_style_lora:
+                    leakage_exclusions.extend(apply_lora_leakage_constraints(
+                        settings,
+                        request_text,
+                        selected_style_lora,
+                    ))
+                    prompt_info["intent_notes"] = (
+                        f"{prompt_info.get('intent_notes', '')} "
+                        f"Style LoRA: {selected_style_lora['name']} "
+                        f"({selected_style_lora['trigger_word']}, "
+                        f"weight {style_lora_weight:.2f})."
+                    ).strip()
+                if leakage_exclusions:
+                    prompt_info["intent_notes"] = (
+                        f"{prompt_info['intent_notes']} "
+                        "Training-set constants suppressed: "
+                        f"{', '.join(dict.fromkeys(leakage_exclusions))}."
+                    )
+            if reference_image_b64 and mode == "t2i":
+                prompt_info["intent_notes"] = (
+                    f"{prompt_info.get('intent_notes', '')} "
+                    f"Character reference image applied at weight {reference_strength:.2f}; "
+                    "the reference supplies appearance while text controls requested changes."
+                ).strip()
             _STATE["refiner"].unload_if_cuda()
             q.put({
                 "type": "optimized_prompt",
@@ -1178,7 +2085,10 @@ def api_generate_start():
                     if background_mask_b64:
                         scene_mask_path = decode_image_to_temp(background_mask_b64, "janku_background_mask")
                         temp_paths.append(scene_mask_path)
-                    source, plain_background_mask = extract_plain_background_mask(source_path)
+                    source = Image.open(source_path).convert("RGB")
+                    plain_background_mask = None
+                    if edit_scope == "background" and not mask_path and not scene_mask_path:
+                        source, plain_background_mask = extract_plain_background_mask(source_path)
                     if scene_mask_path:
                         plain_background_mask = Image.open(scene_mask_path).convert("L").resize(source.size)
                     effective_mask_path = mask_path
@@ -1190,36 +2100,89 @@ def api_generate_start():
                             reusable_mask = Image.open(effective_mask_path).convert("L").resize(source.size)
                         else:
                             reusable_mask = plain_background_mask
+                        if reusable_mask is None:
+                            raise RuntimeError(
+                                "無地背景を自動抽出できませんでした。人物を保護するため処理を中止しました。"
+                                "白い領域を背景にした編集マスクを指定してください。"
+                            )
+                        if effective_mask_path is None:
+                            effective_mask_path = os.path.join(
+                                tempfile.gettempdir(), f"janku_semantic_mask_{uuid.uuid4().hex}.png"
+                            )
+                            reusable_mask.save(effective_mask_path)
+                            temp_paths.append(effective_mask_path)
                     if reusable_mask is not None:
                         mask_buffer = io.BytesIO()
                         reusable_mask.save(mask_buffer, format="PNG")
                         generated_background_mask = base64.b64encode(mask_buffer.getvalue()).decode("ascii")
-                    q.put({
-                        "type": "status",
-                        "phase": "generate",
-                        "message": f"{EDITOR_MODELS[editor_id]['label']} で元画像になじむように編集しています",
-                    })
-                    unload_pipeline("janku_pipe")
-                    if _STATE["editor_id"] != editor_id:
-                        unload_active_editor()
-                    if _STATE["editor_pipe"] is None:
-                        def editor_status(message):
-                            q.put({"type": "status", "phase": "generate", "message": message})
-                        _STATE["editor_pipe"] = load_editor_pipeline(editor_id, status_callback=editor_status)
-                        _STATE["editor_id"] = editor_id
-                    image = edit_image(
-                        editor_id,
-                        _STATE["editor_pipe"],
-                        prompt_info["prompt"],
-                        settings["negative_prompt"],
-                        source_path,
-                        effective_mask_path,
-                        settings["seed"],
-                        strength=edit_strength,
-                        callback=progress,
-                        status_callback=lambda message: q.put({"type": "status", "phase": "generate", "message": message}),
-                        edit_scope=edit_scope,
-                    )
+                    if edit_scope == "background":
+                        q.put({
+                            "type": "status",
+                            "phase": "generate",
+                            "message": (
+                                f"{EDITOR_MODELS[editor_id]['label']} で人物を保護しながら"
+                                "背景をinpaintしています"
+                            ),
+                        })
+                        unload_pipeline("janku_pipe")
+                        if _STATE["editor_id"] != editor_id:
+                            unload_active_editor()
+                        if _STATE["editor_pipe"] is None:
+                            def editor_status(message):
+                                q.put({
+                                    "type": "status",
+                                    "phase": "generate",
+                                    "message": message,
+                                })
+                            _STATE["editor_pipe"] = load_editor_pipeline(
+                                editor_id,
+                                status_callback=editor_status,
+                            )
+                            _STATE["editor_id"] = editor_id
+                        image = edit_image(
+                            editor_id,
+                            _STATE["editor_pipe"],
+                            prompt_info["prompt"],
+                            settings["negative_prompt"],
+                            source_path,
+                            effective_mask_path,
+                            settings["seed"],
+                            strength=edit_strength,
+                            callback=progress,
+                            status_callback=lambda message: q.put({
+                                "type": "status",
+                                "phase": "generate",
+                                "message": message,
+                            }),
+                            edit_scope=edit_scope,
+                        )
+                    else:
+                        q.put({
+                            "type": "status",
+                            "phase": "generate",
+                            "message": f"{EDITOR_MODELS[editor_id]['label']} で元画像になじむように編集しています",
+                        })
+                        unload_pipeline("janku_pipe")
+                        if _STATE["editor_id"] != editor_id:
+                            unload_active_editor()
+                        if _STATE["editor_pipe"] is None:
+                            def editor_status(message):
+                                q.put({"type": "status", "phase": "generate", "message": message})
+                            _STATE["editor_pipe"] = load_editor_pipeline(editor_id, status_callback=editor_status)
+                            _STATE["editor_id"] = editor_id
+                        image = edit_image(
+                            editor_id,
+                            _STATE["editor_pipe"],
+                            prompt_info["prompt"],
+                            settings["negative_prompt"],
+                            source_path,
+                            effective_mask_path,
+                            settings["seed"],
+                            strength=edit_strength,
+                            callback=progress,
+                            status_callback=lambda message: q.put({"type": "status", "phase": "generate", "message": message}),
+                            edit_scope=edit_scope,
+                        )
                 else:
                     q.put({"type": "status", "phase": "generate", "message": f"{IMAGE_MODEL_LABEL}を準備しています"})
                     unload_active_editor()
@@ -1227,6 +2190,36 @@ def api_generate_start():
                         def model_status(message):
                             q.put({"type": "status", "phase": "generate", "message": message})
                         _STATE["janku_pipe"] = load_janku_pipeline(status_callback=model_status)
+                    reference_image = (
+                        decode_image_payload(reference_image_b64)
+                        if reference_image_b64
+                        else None
+                    )
+                    configure_pipeline_reference(
+                        _STATE["janku_pipe"],
+                        enabled=reference_image is not None,
+                        weight=reference_strength,
+                        status_callback=lambda message: q.put({
+                            "type": "status",
+                            "phase": "generate",
+                            "message": message,
+                        }),
+                    )
+                    configure_requested_loras(
+                        _STATE["janku_pipe"],
+                        [
+                            {
+                                "metadata": selected_character_lora,
+                                "weight": character_lora_weight,
+                                "adapter_name": "character_asset",
+                            },
+                            {
+                                "metadata": selected_style_lora,
+                                "weight": style_lora_weight,
+                                "adapter_name": "style_asset",
+                            },
+                        ],
+                    )
                     # Keep the ordered user facts first and reserve room for the
                     # model's quality suffix. The pipeline still uses 77-token
                     # CLIP windows even when its long-prompt helper is enabled.
@@ -1243,10 +2236,9 @@ def api_generate_start():
                         prompt_info["prompt"],
                         settings,
                         callback=progress,
+                        reference_image=reference_image,
                     )
                     image = apply_image_style_tone(image, settings)
-                    if workflow == WORKFLOW_CHARACTER:
-                        image = normalize_plain_background(image)
 
             buf = io.BytesIO()
             image.save(buf, format="PNG")
@@ -1254,14 +2246,114 @@ def api_generate_start():
                 "type": "done",
                 "image": base64.b64encode(buf.getvalue()).decode("ascii"),
                 "original_prompt": prompt,
+                "free_prompt": free_prompt or None,
+                "catalog_prompt": catalog_prompt or None,
                 "optimized_prompt": prompt_info["prompt"],
                 "optimizer_source": prompt_info.get("source", ""),
                 "intent_notes": prompt_info.get("intent_notes", ""),
                 "settings": settings,
+                "image_model_profile": current_model_type(),
+                "image_model_label": IMAGE_MODEL_LABEL,
+                "generation_intent": generation_intent,
+                "character_prompt": character_prompt or None,
+                "scene_prompt": (
+                    scene_prompt
+                    if generation_intent == "story_illustration"
+                    else (prompt if generation_intent == "consistent_regeneration" else None)
+                ),
+                "optimized_character_prompt": optimized_character_prompt or None,
+                "optimized_scene_prompt": optimized_scene_prompt or None,
+                "reference_used": bool(reference_image_b64 and mode == "t2i"),
+                "reference_strength": (
+                    reference_strength
+                    if reference_image_b64 and mode == "t2i"
+                    else None
+                ),
+                "source_scene_prompt": source_scene_prompt or None,
                 "editor_model": editor_id if mode == "edit" else None,
                 "edit_strength": edit_strength if mode == "edit" else None,
                 "edit_scope": edit_scope if mode == "edit" else None,
                 "background_mask": generated_background_mask or None,
+                # Legacy Character-LoRA fields are retained for existing
+                # gallery records and Cloudflare clients.
+                "lora_id": (
+                    selected_character_lora["id"]
+                    if selected_character_lora
+                    else None
+                ),
+                "lora_name": (
+                    selected_character_lora["name"]
+                    if selected_character_lora
+                    else None
+                ),
+                "lora_trigger_word": (
+                    selected_character_lora["trigger_word"]
+                    if selected_character_lora
+                    else None
+                ),
+                "lora_identity_prompt": (
+                    selected_character_lora.get("identity_prompt")
+                    if selected_character_lora
+                    else None
+                ),
+                "lora_weight": (
+                    character_lora_weight if selected_character_lora else None
+                ),
+                "character_lora_id": (
+                    selected_character_lora["id"]
+                    if selected_character_lora
+                    else None
+                ),
+                "character_lora_name": (
+                    selected_character_lora["name"]
+                    if selected_character_lora
+                    else None
+                ),
+                "character_lora_trigger_word": (
+                    selected_character_lora["trigger_word"]
+                    if selected_character_lora
+                    else None
+                ),
+                "character_lora_weight": (
+                    character_lora_weight if selected_character_lora else None
+                ),
+                "style_lora_id": (
+                    selected_style_lora["id"] if selected_style_lora else None
+                ),
+                "style_lora_name": (
+                    selected_style_lora["name"] if selected_style_lora else None
+                ),
+                "style_lora_trigger_word": (
+                    selected_style_lora["trigger_word"]
+                    if selected_style_lora
+                    else None
+                ),
+                "style_lora_weight": (
+                    style_lora_weight if selected_style_lora else None
+                ),
+                "applied_loras": [
+                    {
+                        "id": metadata["id"],
+                        "name": metadata["name"],
+                        "category": category,
+                        "trigger_word": metadata["trigger_word"],
+                        "weight": weight,
+                        "model_type": metadata["model_type"],
+                    }
+                    for metadata, category, weight in (
+                        (
+                            selected_character_lora,
+                            "character",
+                            character_lora_weight,
+                        ),
+                        (
+                            selected_style_lora,
+                            "style",
+                            style_lora_weight,
+                        ),
+                    )
+                    if metadata
+                ],
                 "refine_enabled": refine_enabled,
                 "workflow": workflow,
             })
