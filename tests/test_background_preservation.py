@@ -16,11 +16,16 @@ from app import (
     apply_background_replacement_constraints,
     apply_event_instruction_constraints,
     apply_lora_leakage_constraints,
+    apply_story_composition_defaults,
+    apply_story_scene_constraints,
+    apply_story_subject_constraints,
     apply_source_scene_exclusion,
     background_inpaint_prompt,
     background_prompt_requests_subject_change,
+    batch_generation_seeds,
     build_consistent_story_prompt,
     prioritize_consistent_story_tags,
+    prioritize_story_negative_tags,
     prepare_prompt,
 )
 from image_edit_workflows import (
@@ -37,6 +42,18 @@ from image_edit_workflows import (
 
 
 class BackgroundPreservationTests(unittest.TestCase):
+    def test_batch_generation_seeds_keep_first_and_randomize_followups(self):
+        values = iter((32, 101, 202))
+
+        seeds = batch_generation_seeds(
+            32,
+            3,
+            randbelow=lambda _limit: next(values),
+        )
+
+        self.assertEqual(seeds, [32, 101, 202])
+        self.assertEqual(len(set(seeds)), 3)
+
     def test_character_asset_uses_neutral_background_without_chroma(self):
         settings = app_module.normalize_generation_settings({
             "preset": "bishoujo_game",
@@ -176,16 +193,91 @@ class BackgroundPreservationTests(unittest.TestCase):
 
         constrained = apply_event_instruction_constraints(
             prompt_info,
-            "背景を海に変更。ポーズを顔元でピースに変更。",
+            (
+                "笑顔でこちらを見ている。右手でピースサインを作り、"
+                "指の間から目をのぞかせる。右耳にガラスの林檎のピアス。全身。"
+            ),
             settings,
         )
 
         self.assertTrue(constrained["prompt"].startswith(
-            "(v over eye:1.4), (v:1.3), peace sign, hand beside face"
+            "full body, smile, looking at viewer, right hand, "
+            "(v over eye:1.4), single glass apple earring"
         ))
+        self.assertNotIn("(v:1.3)", constrained["prompt"])
+        self.assertNotIn("looking through fingers", constrained["prompt"])
         self.assertIn("hands under chin", settings["negative_prompt"])
         self.assertIn("finger to lips", settings["negative_prompt"])
         self.assertIn("finger to cheek", settings["negative_prompt"])
+        self.assertIn("earrings on both ears", settings["negative_prompt"])
+
+    def test_story_scene_constraints_preserve_rural_rice_field_evening(self):
+        prompt_info = {"prompt": "soft lighting"}
+
+        constrained = apply_story_scene_constraints(
+            prompt_info,
+            "田舎の田んぼ道で学校の帰りの夕方。",
+        )
+
+        self.assertIn("countryside", constrained["prompt"])
+        self.assertIn("rice fields", constrained["prompt"])
+        self.assertIn("rural road", constrained["prompt"])
+        self.assertIn("after school", constrained["prompt"])
+        self.assertIn("sunset", constrained["prompt"])
+        self.assertTrue(constrained["prompt"].startswith(
+            "countryside, rice fields, rural road, after school, sunset"
+        ))
+
+    def test_story_subject_constraints_infer_single_girl_from_lora_captions(self):
+        settings = {"negative_prompt": "low quality"}
+        prompt_info = {
+            "prompt": "multiple girls, petite, smile, rice fields",
+            "intent_notes": "",
+        }
+        metadata = {
+            "captions": [{
+                "training_caption": "1girl, solo, blonde hair, red eyes",
+            }],
+        }
+
+        constrained = apply_story_subject_constraints(
+            prompt_info,
+            settings,
+            "笑顔でこちらを見ている。",
+            metadata,
+        )
+
+        self.assertTrue(constrained["prompt"].startswith("1girl, solo"))
+        self.assertNotIn("multiple girls", constrained["prompt"])
+        self.assertIn("multiple girls", settings["negative_prompt"])
+        self.assertIn("duplicate", settings["negative_prompt"])
+        self.assertIn("blue background", settings["negative_prompt"])
+
+    def test_story_subject_constraints_allow_explicit_group(self):
+        settings = {"negative_prompt": "low quality"}
+        prompt_info = {"prompt": "2girls, rice fields", "intent_notes": ""}
+
+        constrained = apply_story_subject_constraints(
+            prompt_info,
+            settings,
+            "二人の少女が田んぼ道を歩く。",
+            None,
+        )
+
+        self.assertEqual(constrained["prompt"], "2girls, rice fields")
+        self.assertNotIn("multiple girls", settings["negative_prompt"])
+
+    def test_full_body_story_defaults_square_animagine_canvas_to_portrait(self):
+        settings = {"width": 1024, "height": 1024}
+
+        with patch.object(app_module, "IMAGE_MODEL_FAMILY", "animagine"):
+            changed = apply_story_composition_defaults(
+                settings,
+                "全身を描く。",
+            )
+
+        self.assertTrue(changed)
+        self.assertEqual((settings["width"], settings["height"]), (768, 1152))
 
     def test_consistent_story_tags_put_one_character_before_pose_and_scene(self):
         prompt_info = {
@@ -221,7 +313,7 @@ class BackgroundPreservationTests(unittest.TestCase):
         prioritized = prioritize_consistent_story_tags(prompt_info)
 
         self.assertTrue(prioritized["prompt"].startswith(
-            "1girl, solo, petite, youthful round face, centered back hair bun, pink eyes"
+            "1girl, solo, petite, centered back hair bun, pink eyes, youthful round face"
         ))
         self.assertLess(
             prioritized["prompt"].index("pink eyes"),
@@ -229,12 +321,87 @@ class BackgroundPreservationTests(unittest.TestCase):
         )
         self.assertLess(
             prioritized["prompt"].index("standing"),
+            prioritized["prompt"].index("seaside promenade"),
+        )
+        self.assertLess(
+            prioritized["prompt"].index("seaside promenade"),
             prioritized["prompt"].index("white dress"),
         )
         self.assertLess(
             prioritized["prompt"].index("seaside promenade"),
             prioritized["prompt"].index("soft anime illustration"),
         )
+
+    def test_story_priority_compacts_pose_and_identity_before_scene(self):
+        prompt_info = {
+            "prompt": (
+                "countryside, rice fields, rural road, after school, sunset, "
+                "full body, smile, looking at viewer, right hand, (v over eye:1.4), "
+                "(v:1.3), peace sign, looking through fingers, hand beside face, "
+                "single earring, glass apple earring, 1girl, solo, petite, "
+                "small frame, short stature, youthful face, blonde hair, medium hair, "
+                "half updo, small braided bun, back bun, white cat hairclip, red eyes, "
+                "masterpiece, high score, great score, absurdres"
+            )
+        }
+
+        prioritized = prioritize_consistent_story_tags(prompt_info)
+
+        self.assertTrue(prioritized["prompt"].startswith(
+            "1girl, solo, petite, blonde hair, braided back bun, red eyes, "
+            "full body, smile, looking at viewer, right hand, (v over eye:1.4), "
+            "single glass apple earring, countryside, rice fields, rural road, "
+            "after school, sunset"
+        ))
+        self.assertNotIn("(v:1.3)", prioritized["prompt"])
+        self.assertNotIn("looking through fingers", prioritized["prompt"])
+        self.assertNotIn("hand beside face", prioritized["prompt"])
+
+    def test_story_negative_tags_prioritize_duplicate_background_and_body_failures(self):
+        settings = {
+            "negative_prompt": (
+                "low quality, side bun, blue background, long legs, "
+                "multiple girls, bad anatomy, curvy"
+            )
+        }
+
+        prioritize_story_negative_tags(settings)
+
+        self.assertTrue(settings["negative_prompt"].startswith(
+            "multiple girls, blue background, long legs, curvy, side bun, bad anatomy"
+        ))
+
+    def test_story_prompt_compacts_verbose_lora_identity(self):
+        settings = app_module.normalize_generation_settings({
+            "preset": "bishoujo_game",
+            "negative_prompt": "low quality",
+        })
+        character = {
+            "prompt": (
+                "petite proportions, youthful face, shoulder-length blonde hair, "
+                "half updo, one small braided bun centered at the back of the head, "
+                "white cat-shaped hair ornament, rose crimson eyes, deep reddish-pink irises"
+            ),
+            "intent_notes": "",
+            "source": "test",
+        }
+        scene = {
+            "prompt": "full body, smile, rice fields, evening",
+            "intent_notes": "",
+            "source": "test",
+        }
+
+        result = build_consistent_story_prompt(character, scene, settings)
+
+        self.assertIn("petite", result["prompt"])
+        self.assertIn("blonde hair", result["prompt"])
+        self.assertIn("medium hair", result["prompt"])
+        self.assertIn("small braided bun", result["prompt"])
+        self.assertIn("back bun", result["prompt"])
+        self.assertIn("white cat hairclip", result["prompt"])
+        self.assertIn("red eyes", result["prompt"])
+        self.assertNotIn("petite proportions", result["prompt"])
+        self.assertNotIn("deep reddish-pink irises", result["prompt"])
 
     def test_previous_scene_is_excluded_without_blocking_shared_target_tags(self):
         settings = {"negative_prompt": "low quality"}
@@ -694,6 +861,71 @@ class BackgroundPreservationTests(unittest.TestCase):
         self.assertIsNone(done["background_mask"])
         self.assertFalse(done["reference_used"])
 
+    def test_character_api_generates_batch_sequentially_with_unique_seeds(self):
+        class ImmediateThread:
+            def __init__(self, target, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        previous_pipe = app_module._STATE["janku_pipe"]
+        app_module._STATE["janku_pipe"] = None
+        try:
+            with (
+                patch("app.threading.Thread", ImmediateThread),
+                patch("app.load_janku_pipeline", return_value=object()),
+                patch("app.configure_pipeline_reference"),
+                patch("app.configure_requested_loras"),
+                patch(
+                    "app.batch_generation_seeds",
+                    return_value=[32, 101, 202],
+                ),
+                patch(
+                    "app.generate_with_janku",
+                    return_value=Image.new("RGB", (32, 32), "blue"),
+                ) as generate,
+            ):
+                client = app_module.app.test_client()
+                response = client.post("/api/generate/start", json={
+                    "workflow": "character",
+                    "mode": "t2i",
+                    "generation_intent": "character_asset",
+                    "prompt": "1girl, solo, full body",
+                    "character_prompt": "1girl, solo, full body",
+                    "refine_enabled": False,
+                    "batch_count": 3,
+                    "seed": 32,
+                    "width": 512,
+                    "height": 512,
+                    "steps": 10,
+                })
+                self.assertEqual(response.status_code, 200)
+                job_id = response.get_json()["job_id"]
+                stream = client.get(f"/api/generate/stream/{job_id}")
+                events = [
+                    json.loads(line[6:])
+                    for line in stream.get_data(as_text=True).splitlines()
+                    if line.startswith("data: ")
+                ]
+        finally:
+            app_module._STATE["janku_pipe"] = previous_pipe
+
+        self.assertEqual(generate.call_count, 3)
+        self.assertEqual(
+            [call.args[2]["seed"] for call in generate.call_args_list],
+            [32, 101, 202],
+        )
+        batch_images = [event for event in events if event["type"] == "batch_image"]
+        self.assertEqual(len(batch_images), 3)
+        self.assertEqual(
+            [event["settings"]["seed"] for event in batch_images],
+            [32, 101, 202],
+        )
+        done = next(event for event in events if event["type"] == "done")
+        self.assertEqual(done["batch_count"], 3)
+        self.assertNotIn("image", done)
+
     def test_story_api_applies_character_and_style_loras_independently(self):
         class ImmediateThread:
             def __init__(self, target, daemon):
@@ -790,7 +1022,8 @@ class BackgroundPreservationTests(unittest.TestCase):
             generated_tags.index("hinata_chr"),
             generated_tags.index("vn_style"),
         )
-        self.assertIn("petite proportions", generated_prompt)
+        self.assertIn("petite", generated_prompt)
+        self.assertNotIn("petite proportions", generated_prompt)
         self.assertIn("back bun", generated_prompt)
         self.assertIn("pink eyes", generated_prompt)
         generated_settings = generate.call_args.args[2]

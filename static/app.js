@@ -21,12 +21,15 @@ const DB_VERSION = 2;
 const HISTORY_STORE = "prompt-history";
 const FAVORITES_STORE = "favorite-groups";
 const FOLDERS_STORE = "gallery-folders";
+const STYLE_CACHE_KEY = "illustration-style-strength-v1";
 
 let activeWorkflow = "character";
 let composeSourceImage = "";
 let composeSourceLabel = "";
 let currentImage = "";
 let currentMetadata = {};
+let batchResults = [];
+let selectedBatchIndex = 0;
 let rootPrompt = "";
 let rootOptimizedPrompt = "";
 let rootCharacterPrompt = "";
@@ -281,7 +284,38 @@ function syncSlider(id) {
   $(id + "-value").value = $(id).value;
 }
 
-function applyPreset() {
+function persistStyleSettings() {
+  try {
+    localStorage.setItem(STYLE_CACHE_KEY, JSON.stringify(styleSettings()));
+  } catch (error) {
+    console.warn("Style settings could not be cached", error);
+  }
+}
+
+function applyStyleSettings(values, persist = true) {
+  if (!values || typeof values !== "object") return false;
+  let applied = false;
+  styleFields.forEach(([id, key]) => {
+    const value = Number(values[key]);
+    if (!Number.isFinite(value)) return;
+    $(id).value = Math.max(0, Math.min(100, Math.round(value)));
+    syncSlider(id);
+    applied = true;
+  });
+  if (applied && persist) persistStyleSettings();
+  return applied;
+}
+
+function restoreCachedStyleSettings() {
+  try {
+    const cached = JSON.parse(localStorage.getItem(STYLE_CACHE_KEY) || "null");
+    applyStyleSettings(cached, false);
+  } catch (error) {
+    console.warn("Cached style settings could not be restored", error);
+  }
+}
+
+function applyPreset(persist = true) {
   const preset = presets[$("preset").value];
   $("width").value = preset.width;
   $("height").value = preset.height;
@@ -294,6 +328,7 @@ function applyPreset() {
     $(id).value = preset.style[key];
     syncSlider(id);
   });
+  if (persist) persistStyleSettings();
 }
 
 function styleSettings() {
@@ -351,6 +386,14 @@ function promptPartsForWorkflow(workflow) {
     catalogPrompt,
     prompt: [freeText, catalogPrompt].filter(Boolean).join("\n"),
   };
+}
+
+function batchCountForWorkflow(workflow) {
+  const input = $(`${workflow}-batch-count`);
+  if (!input) return 1;
+  const count = Math.max(1, Math.min(8, Math.round(Number(input.value) || 1)));
+  input.value = count;
+  return count;
 }
 
 function selectedGroupName(item) {
@@ -692,6 +735,7 @@ async function savePromptHistory(data, prompt) {
       optimizer_source: data.optimizer_source || "",
       intent_notes: data.intent_notes || "",
       generation_settings: data.settings || {},
+      style_settings: data.settings?.style || styleSettings(),
       image_model_profile: data.image_model_profile || "",
       image_model_label: data.image_model_label || "",
       workflow: data.workflow || "",
@@ -777,6 +821,12 @@ function applyHistoryPrompt(record) {
   textarea.value = record.prompt;
   selectedCatalog[historyTargetWorkflow] = [];
   renderSelected(historyTargetWorkflow);
+  const generationSettings = record.metadata?.generation_settings || {};
+  applyStyleSettings(
+    record.metadata?.style_settings
+      || generationSettings.style
+      || generationSettings.style_settings,
+  );
   $("history-dialog").close();
   textarea.focus();
 }
@@ -1320,22 +1370,44 @@ async function runJob(payload) {
   const start = await response.json();
   if (!response.ok) throw new Error(start.error || "処理を開始できませんでした");
   return new Promise((resolve, reject) => {
+    const batchImages = [];
     const stream = new EventSource(`/api/generate/stream/${start.job_id}`);
     stream.onmessage = (event) => {
       const data = JSON.parse(event.data);
       if (data.type === "status") {
-        $("progress-title").textContent = data.phase === "generate" ? "画像を生成中" : "プロンプトを準備中";
+        const imageLabel = data.image_total > 1
+          ? `${data.image_index} / ${data.image_total} 枚目 `
+          : "";
+        $("progress-title").textContent = data.phase === "generate"
+          ? `${imageLabel}画像を生成中`
+          : "プロンプトを準備中";
         $("progress-message").textContent = data.message || "";
       } else if (data.type === "optimized_prompt") {
         $("progress-title").textContent = "画像を生成中";
         $("progress-message").textContent = "モデルへプロンプトを送信しました";
       } else if (data.type === "progress") {
         const percent = Math.round((data.step / data.total) * 100);
-        $("progress-title").textContent = `画像を生成中 ${percent}%`;
+        const imageLabel = data.image_total > 1
+          ? `${data.image_index} / ${data.image_total} 枚目 `
+          : "";
+        $("progress-title").textContent = `${imageLabel}画像を生成中 ${percent}%`;
         $("progress-message").textContent = `${data.step} / ${data.total} steps`;
         $("progress-fill").style.width = `${percent}%`;
+      } else if (data.type === "batch_image") {
+        batchImages.push(data);
+        $("progress-title").textContent = `${data.image_index} / ${data.image_total} 枚目が完了`;
+        $("progress-message").textContent = "次の画像を同じ設定で順番に生成します";
+        $("progress-fill").style.width = `${Math.round((data.image_index / data.image_total) * 100)}%`;
       } else if (data.type === "done") {
         stream.close();
+        data.images = batchImages.length
+          ? batchImages
+          : [{
+            image: data.image,
+            settings: data.settings,
+            image_index: 1,
+            image_total: 1,
+          }];
         resolve(data);
       } else if (data.type === "error") {
         stream.close();
@@ -1349,7 +1421,7 @@ async function runJob(payload) {
   });
 }
 
-function showResult(data, historyPrompt) {
+function updateLoraState(data) {
   if (data.workflow === "character") {
     rootLoraMetadata = (
       data.character_lora_id || data.lora_id || data.style_lora_id
@@ -1368,6 +1440,10 @@ function showResult(data, historyPrompt) {
   ) {
     rootLoraMetadata = loraMetadataFromResult(data);
   }
+}
+
+function showResult(data, historyPrompt) {
+  updateLoraState(data);
   currentImage = data.image;
   currentGalleryRecordId = "";
   currentImages[data.workflow] = data.image;
@@ -1381,6 +1457,7 @@ function showResult(data, historyPrompt) {
     intent_notes: data.intent_notes,
     refine_enabled: data.refine_enabled,
     generation_settings: data.settings,
+    style_settings: data.settings?.style || styleSettings(),
     image_model_profile: data.image_model_profile || "",
     image_model_label: data.image_model_label || "",
     workflow: data.workflow,
@@ -1428,6 +1505,94 @@ function showResult(data, historyPrompt) {
   savePromptHistory(data, historyPrompt).catch((error) => console.warn("Prompt history could not be saved", error));
 }
 
+function selectBatchResult(index) {
+  const entry = batchResults[index];
+  if (!entry) return;
+  selectedBatchIndex = index;
+  currentImage = entry.data.image;
+  currentMetadata = entry.metadata;
+  currentGalleryRecordId = "";
+  currentImages[entry.data.workflow] = entry.data.image;
+  $("result-image").src = "data:image/png;base64," + entry.data.image;
+  $("optimized-prompt").textContent = entry.data.optimized_prompt;
+  $("result-workflow-label").textContent = entry.label;
+  $("use-result-in-compose").hidden = entry.data.workflow !== "character";
+  $("save-r2").textContent = "R2に保存";
+  $("result-batch-grid").querySelectorAll(".batch-result-card").forEach(
+    (card, cardIndex) => card.setAttribute(
+      "aria-pressed",
+      String(cardIndex === selectedBatchIndex),
+    ),
+  );
+  if (entry.data.workflow === "character") {
+    setComposeSource(entry.data.image, "キャラクター生成の結果");
+  }
+  if (entry.data.workflow === "compose") {
+    setComposeSource(entry.data.image, "直前の再生成結果");
+  }
+}
+
+function renderBatchResults() {
+  const grid = $("result-batch-grid");
+  const multiple = batchResults.length > 1;
+  grid.replaceChildren();
+  grid.hidden = !multiple;
+  $("result-single-stage").hidden = multiple;
+  $("batch-result-summary").hidden = !multiple;
+  if (!multiple) return;
+  $("batch-result-summary").textContent = (
+    batchResults.length
+    + "枚を1枚ずつ生成しました。画像を選ぶと、保存・再生成の対象が切り替わります。"
+  );
+  batchResults.forEach((entry, index) => {
+    const card = createElement("button", "batch-result-card");
+    card.type = "button";
+    card.setAttribute("aria-pressed", String(index === selectedBatchIndex));
+    const image = document.createElement("img");
+    image.src = "data:image/png;base64," + entry.data.image;
+    image.alt = "生成画像 " + (index + 1);
+    const seed = entry.data.settings?.seed;
+    const caption = createElement(
+      "span",
+      "",
+      (index + 1) + " / " + batchResults.length
+        + (seed == null ? "" : " ・ Seed " + seed),
+    );
+    card.append(image, caption);
+    card.addEventListener("click", () => selectBatchResult(index));
+    grid.append(card);
+  });
+}
+
+function showGenerationResults(data, historyPrompt) {
+  const images = data.images || [{
+    image: data.image,
+    settings: data.settings,
+    image_index: 1,
+    image_total: 1,
+  }];
+  batchResults = [];
+  images.forEach((imageData) => {
+    const resultData = {
+      ...data,
+      image: imageData.image,
+      settings: imageData.settings || data.settings,
+      batch_index: imageData.image_index || 1,
+      batch_total: imageData.image_total || images.length,
+    };
+    delete resultData.images;
+    showResult(resultData, historyPrompt);
+    batchResults.push({
+      data: resultData,
+      metadata: {...currentMetadata},
+      label: $("result-workflow-label").textContent,
+    });
+  });
+  selectedBatchIndex = 0;
+  renderBatchResults();
+  selectBatchResult(0);
+}
+
 async function generateCharacter() {
   const promptParts = promptPartsForWorkflow("character");
   const prompt = promptParts.prompt;
@@ -1446,6 +1611,7 @@ async function generateCharacter() {
       free_prompt: promptParts.freeText,
       catalog_prompt: promptParts.catalogPrompt,
       refine_enabled: $("character-refine-enabled").checked,
+      batch_count: batchCountForWorkflow("character"),
       ...loraGenerationSettings("character"),
       ...generationSettings(),
     });
@@ -1459,7 +1625,7 @@ async function generateCharacter() {
     $("edit-history").replaceChildren();
     $("compose-character-definition").value = prompt;
     applyLoraMetadataToWorkflow(loraMetadataFromResult(data), "compose");
-    showResult(data, rootPrompt);
+    showGenerationResults(data, rootPrompt);
   } catch (error) {
     setError(error.message);
     $("progress").hidden = true;
@@ -1503,6 +1669,7 @@ async function generateCompose() {
       free_prompt: promptParts.freeText,
       catalog_prompt: promptParts.catalogPrompt,
       refine_enabled: $("compose-refine-enabled").checked,
+      batch_count: method === "regenerate" ? batchCountForWorkflow("compose") : 1,
       ...generationSettings(),
     };
     if (method === "regenerate") {
@@ -1530,7 +1697,7 @@ async function generateCompose() {
     rootOptimizedScenePrompt = data.optimized_scene_prompt || prompt;
     rootPrompt = rootPrompt || `人物: ${rootCharacterPrompt}\n変更: ${prompt}`;
     editInstructions.push(prompt);
-    showResult(data, prompt);
+    showGenerationResults(data, prompt);
     $("edit-history").append(createElement(
       "div",
       "assistant",
@@ -1588,8 +1755,11 @@ async function saveToR2() {
 }
 
 function bindEvents() {
-  $("preset").addEventListener("change", applyPreset);
-  styleFields.forEach(([id]) => $(id).addEventListener("input", () => syncSlider(id)));
+  $("preset").addEventListener("change", () => applyPreset(true));
+  styleFields.forEach(([id]) => $(id).addEventListener("input", () => {
+    syncSlider(id);
+    persistStyleSettings();
+  }));
   $("compose-strength").addEventListener("input", () => {
     $("compose-strength-value").value = $("compose-strength").value;
   });
@@ -1607,6 +1777,8 @@ function bindEvents() {
   $("compose-method").addEventListener("change", syncComposeEditControls);
   $("character-auto-background").addEventListener("change", syncCharacterCommand);
   $("character-scene-prompt").addEventListener("input", syncCharacterCommand);
+  $("character-batch-count").addEventListener("input", syncCharacterCommand);
+  $("compose-batch-count").addEventListener("input", syncComposeEditControls);
   $("generate-character").addEventListener("click", generateCharacter);
   $("generate-compose").addEventListener("click", generateCompose);
   $("save-r2").addEventListener("click", saveToR2);
@@ -1734,9 +1906,14 @@ function syncCharacterCommand() {
     $("character-auto-background").checked
     && $("character-scene-prompt").value.trim()
   );
-  $("generate-character").textContent = story
-    ? "シーン込みの一枚絵を生成"
-    : "キャラクター素材を生成";
+  const count = batchCountForWorkflow("character");
+  $("generate-character").textContent = count > 1
+    ? story
+      ? count + "枚の一枚絵を順番に生成"
+      : count + "枚のキャラクター素材を順番に生成"
+    : story
+      ? "シーン込みの一枚絵を生成"
+      : "キャラクター素材を生成";
 }
 
 function syncComposeEditControls() {
@@ -1746,16 +1923,21 @@ function syncComposeEditControls() {
   $("compose-lora-field").hidden = !regenerate;
   $("compose-reference-strength-field").hidden = !regenerate;
   $("compose-mask-settings").hidden = regenerate;
+  $("compose-batch-count-field").hidden = !regenerate;
   $("compose-strength-field").hidden = regenerate;
   $("compose-strength-value").value = $("compose-strength").value;
+  const count = batchCountForWorkflow("compose");
   $("generate-compose").textContent = regenerate
-    ? "同じキャラクターで再生成"
+    ? count > 1
+      ? count + "枚を順番に一貫再生成"
+      : "同じキャラクターで再生成"
     : "手動マスクの範囲を修正";
 }
 
 async function initialize() {
   bindEvents();
-  applyPreset();
+  applyPreset(false);
+  restoreCachedStyleSettings();
   syncCharacterCommand();
   syncComposeEditControls();
   renderSelected("character");

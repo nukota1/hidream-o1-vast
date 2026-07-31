@@ -7,6 +7,7 @@ import json
 import os
 import queue
 import re
+import secrets
 import subprocess
 import tempfile
 import threading
@@ -148,6 +149,21 @@ CHARACTER_NEGATIVE_TAGS = (
     "background shadow",
     "multiple views",
     "character sheet",
+)
+SINGLE_SUBJECT_NEGATIVE_TAGS = (
+    "multiple girls",
+    "multiple boys",
+    "2girls",
+    "2boys",
+    "group",
+    "crowd",
+    "twins",
+    "clone",
+    "duplicate",
+    "multiple views",
+    "character sheet",
+    "solid color background",
+    "blue background",
 )
 BACKGROUNDLESS_JAPANESE_PATTERNS = (
     r"背景\s*(?:を|は)?\s*(?:描かない|描くな|描かなくて|不要|いらない|なし|無し|省略)",
@@ -326,6 +342,18 @@ def clamp_float(value, default, low, high):
     return max(low, min(high, parsed))
 
 
+def batch_generation_seeds(base_seed, count, randbelow=None):
+    """Return unique seeds while keeping the first result reproducible."""
+    total = clamp_int(count, 1, 1, 8)
+    seeds = [clamp_int(base_seed, 32, 0, 2**31 - 1)]
+    random_value = randbelow or secrets.randbelow
+    while len(seeds) < total:
+        candidate = int(random_value(2**31))
+        if candidate not in seeds:
+            seeds.append(candidate)
+    return seeds
+
+
 def normalize_dimension(value, default):
     value = clamp_int(value, default, 512, 2048)
     return max(512, (value // 64) * 64)
@@ -462,6 +490,159 @@ def split_prompt_tags(prompt):
     return [tag.strip() for tag in re.split(r"[,\n]", str(prompt)) if tag.strip()]
 
 
+def normalize_story_character_tags(tags):
+    """Compact verbose identity prose before it competes with requested scene tags."""
+    normalized = []
+    for raw_tag in tags:
+        tag = str(raw_tag or "").strip()
+        value = tag.lower()
+        if not tag:
+            continue
+        if value == "petite proportions":
+            normalized.append("petite")
+            continue
+        shoulder_hair = re.fullmatch(
+            r"shoulder[- ]length (blonde|black|brown|red|blue|pink|white|silver|purple|green) hair",
+            value,
+        )
+        if shoulder_hair:
+            normalized.extend((f"{shoulder_hair.group(1)} hair", "medium hair"))
+            continue
+        if "bun" in value and "back of the head" in value:
+            normalized.extend(("small braided bun", "back bun"))
+            continue
+        cat_ornament = re.fullmatch(
+            r"(white|black|red|blue|pink)?\s*cat[- ]shaped hair ornament",
+            value,
+        )
+        if cat_ornament:
+            color = (cat_ornament.group(1) or "").strip()
+            normalized.append(f"{color + ' ' if color else ''}cat hairclip")
+            continue
+        if re.fullmatch(
+            r"(?:rose crimson eyes?|deep reddish[- ]pink irises?)",
+            value,
+        ):
+            normalized.append("red eyes")
+            continue
+        normalized.append(tag)
+    return join_unique_tags(normalized).split(", ")
+
+
+def lora_subject_tags(lora_metadata):
+    """Read a compact subject count from metadata or its training captions."""
+    metadata = lora_metadata or {}
+    configured = split_prompt_tags(metadata.get("subject_prompt") or "")
+    if configured:
+        return configured
+    caption_text = " ".join(
+        str(item.get("training_caption") or "")
+        for item in (metadata.get("captions") or [])
+        if isinstance(item, dict)
+    ).lower()
+    for subject in ("1girl", "1boy", "1other"):
+        if re.search(rf"(?:^|[,\s]){re.escape(subject)}(?:[,\s]|$)", caption_text):
+            return [subject, "solo"]
+    return []
+
+
+def prompt_requests_multiple_subjects(prompt):
+    value = str(prompt or "")
+    return bool(
+        re.search(
+            r"(?:複数人|二人|2人|三人|3人|双子|グループ|群衆|"
+            r"\b(?:2girls|2boys|3girls|3boys|multiple girls|multiple boys|"
+            r"group|crowd|twins)\b)",
+            value,
+            re.IGNORECASE,
+        )
+    )
+
+
+def apply_story_subject_constraints(
+    prompt_info,
+    settings,
+    original_prompt,
+    lora_metadata=None,
+):
+    """Keep the one-character web workflow from turning into a collage."""
+    if prompt_requests_multiple_subjects(original_prompt):
+        return prompt_info
+    tags = split_prompt_tags(prompt_info.get("prompt", ""))
+    count_pattern = re.compile(
+        r"^(?:[2-9](?:girls?|boys?)|multiple (?:girls?|boys?)|group|crowd|twins)$",
+        re.IGNORECASE,
+    )
+    tags = [tag for tag in tags if not count_pattern.fullmatch(tag)]
+    subject_tags = lora_subject_tags(lora_metadata)
+    if not subject_tags:
+        text = ", ".join(tags).lower()
+        if re.search(r"\b(?:1girl|girl|female|woman)\b", text):
+            subject_tags = ["1girl", "solo"]
+        elif re.search(r"\b(?:1boy|boy|male|man)\b", text):
+            subject_tags = ["1boy", "solo"]
+        else:
+            subject_tags = ["solo"]
+    prompt_info["prompt"] = join_unique_tags(subject_tags, tags)
+    settings["negative_prompt"] = join_unique_tags(
+        split_prompt_tags(settings.get("negative_prompt", "")),
+        SINGLE_SUBJECT_NEGATIVE_TAGS,
+    )
+    prompt_info["intent_notes"] = (
+        f"{prompt_info.get('intent_notes', '')} "
+        "The single-character workflow enforced one subject and suppressed "
+        "duplicate-character or character-sheet layouts."
+    ).strip()
+    return prompt_info
+
+
+def apply_story_scene_constraints(prompt_info, original_prompt):
+    """Preserve explicit Japanese scene anchors if the refiner becomes too generic."""
+    value = str(original_prompt or "")
+    scene_tags = []
+    if re.search(r"(?:田舎|農村|\bcountryside\b|\brural\b)", value, re.IGNORECASE):
+        scene_tags.append("countryside")
+    if re.search(r"(?:田んぼ|田園|稲田|\brice fields?\b|\bpaddy fields?\b)", value, re.IGNORECASE):
+        scene_tags.append("rice fields")
+    if re.search(r"(?:田んぼ道|田舎.{0,8}道|農道|\brural road\b|\bcountry road\b)", value, re.IGNORECASE):
+        scene_tags.append("rural road")
+    if re.search(r"(?:学校.{0,6}帰り|下校|\bafter school\b)", value, re.IGNORECASE):
+        scene_tags.append("after school")
+    if re.search(r"(?:夕方|夕暮れ|日没|\bevening\b|\bsunset\b|\bdusk\b)", value, re.IGNORECASE):
+        # "sunset" carries both the time and warm-light intent while using
+        # fewer CLIP tokens than three near-synonymous tags.
+        scene_tags.append("sunset")
+    if not scene_tags:
+        return prompt_info
+    prompt_info["prompt"] = join_unique_tags(
+        scene_tags,
+        split_prompt_tags(prompt_info.get("prompt", "")),
+    )
+    prompt_info["intent_notes"] = (
+        f"{prompt_info.get('intent_notes', '')} "
+        "Explicit location and time-of-day anchors were preserved from the scene request."
+    ).strip()
+    return prompt_info
+
+
+def apply_story_composition_defaults(settings, original_prompt):
+    """Use a portrait canvas when an Animagine story request explicitly asks for full body."""
+    requests_full_body = bool(re.search(
+        r"(?:全身|足元まで|\bfull body\b|\bhead to toe\b)",
+        str(original_prompt or ""),
+        re.IGNORECASE,
+    ))
+    if (
+        IMAGE_MODEL_FAMILY == "animagine"
+        and requests_full_body
+        and settings.get("width") == settings.get("height")
+    ):
+        settings["width"] = 768
+        settings["height"] = 1152
+        return True
+    return False
+
+
 def background_suppression_requested(user_prompt, mode):
     """Treat an explicit no-background request as composition, not style."""
     if mode != "t2i":
@@ -483,6 +664,14 @@ def _is_background_scene_tag(tag):
         "room",
         "street",
         "city",
+        "countryside",
+        "rural",
+        "rice field",
+        "paddy field",
+        "seaside",
+        "sea",
+        "ocean",
+        "promenade",
         "forest",
         "sky",
         "cloud",
@@ -499,6 +688,9 @@ def _is_background_scene_tag(tag):
         "puddle",
         "sunset",
         "sunrise",
+        "evening",
+        "dusk",
+        "after school",
         "schoolyard",
         "school yard",
         "classroom",
@@ -971,6 +1163,7 @@ def build_consistent_story_prompt(character_info, scene_info, settings):
             ))
         else:
             character_tags.append(tag)
+    character_tags = normalize_story_character_tags(character_tags)
     character_text = ", ".join(character_tags).lower()
     has_subject_count = bool(re.search(
         r"(?:^|,\s*)(?:[1-9](?:girl|boy)s?|multiple (?:girls|boys)|group)(?:,|$)",
@@ -1013,12 +1206,53 @@ def build_consistent_story_prompt(character_info, scene_info, settings):
 
 
 def prioritize_consistent_story_tags(prompt_info):
-    """Keep immutable identity and requested action ahead of optional styling."""
+    """Reserve the CLIP window for identity, action, and scene before styling."""
     tags = [
         tag.strip()
         for tag in re.split(r"[,\n]", prompt_info["prompt"])
         if tag.strip()
     ]
+    values = [tag.lower() for tag in tags]
+    if "small braided bun" in values and "back bun" in values:
+        combined = []
+        inserted_bun = False
+        for tag in tags:
+            if tag.lower() in {"small braided bun", "back bun"}:
+                if not inserted_bun:
+                    combined.append("braided back bun")
+                    inserted_bun = True
+                continue
+            combined.append(tag)
+        tags = combined
+
+    if any("v over eye" in tag.lower() for tag in tags):
+        redundant_pose_terms = (
+            "peace sign",
+            "looking through fingers",
+            "hand beside face",
+            "peeking eyes through",
+        )
+        tags = [
+            tag for tag in tags
+            if "v over eye" in tag.lower()
+            or (
+                not tag.lower().startswith("(v:")
+                and not any(term in tag.lower() for term in redundant_pose_terms)
+            )
+        ]
+
+    if any("glass apple earring" in tag.lower() for tag in tags):
+        compact_earring_tags = []
+        inserted_earring = False
+        for tag in tags:
+            value = tag.lower()
+            if value == "single earring" or "glass apple earring" in value:
+                if not inserted_earring:
+                    compact_earring_tags.append("single glass apple earring")
+                    inserted_earring = True
+                continue
+            compact_earring_tags.append(tag)
+        tags = compact_earring_tags
 
     def priority(tag):
         value = tag.lower()
@@ -1036,32 +1270,122 @@ def prioritize_consistent_story_tags(prompt_info):
             "one hand raised", "standing", "sitting", "kneeling", "crouching",
             "lying", "running", "jumping", "waving", "looking at viewer",
             "full body", "upper body", "portrait", "from behind", "back view",
-            "profile", "smile", "expression", "arms ", "hands ",
+            "profile", "smile", "expression", "arms ", "hands ", "right hand",
+            "looking through fingers", "earring", "jewelry",
         )):
             return 2
+        if _is_background_scene_tag(tag):
+            return 3
         if any(term in value for term in (
             "female student", "male student", "school uniform",
             "uniform", "outfit", "dress", "shirt", "skirt", "jacket", "ribbon",
             "shorts", "pants", "shoes", "boots", "socks", "stockings",
             "accessory",
         )):
-            return 3
+            return 4
         if any(term in value for term in (
             "visual novel", "anime illustration", "lineart", "line art",
             "shading", "rendering", "lighting", "pastel colors",
             "vivid colors", "highly detailed", "intricate details",
         )):
-            return 5
+            return 6
         if any(term in value for term in (
             "masterpiece", "high score", "great score", "absurdres",
         )):
-            return 6
-        return 4
+            return 7
+        return 5
 
+    buckets = {index: [] for index in range(8)}
+    for tag in tags:
+        buckets[priority(tag)].append(tag)
+
+    def identity_rank(tag):
+        value = tag.lower()
+        if "petite" in value:
+            return 0
+        if re.search(
+            r"\b(?:blonde|black|brown|red|blue|pink|white|silver|purple|green) hair\b",
+            value,
+        ):
+            return 1
+        if any(term in value for term in ("bun", "braid", "ponytail", "twintail")):
+            return 2
+        if "eye" in value:
+            return 3
+        if any(term in value for term in (
+            "updo",
+            "hair clip",
+            "hairclip",
+            "hairpin",
+            "hair ornament",
+        )):
+            return 4
+        if any(term in value for term in ("face", "facial", "youthful")):
+            return 5
+        return 6
+
+    identity = [
+        tag for _index, tag in sorted(
+            enumerate(buckets[1]),
+            key=lambda item: (identity_rank(item[1]), item[0]),
+        )
+    ]
+    # Four compact identity anchors, the explicit action, and five scene
+    # anchors leave room for the LoRA trigger and Animagine quality suffix in
+    # both 77-token CLIP windows.
     prompt_info["prompt"] = join_unique_tags(
-        sorted(tags, key=priority),
+        buckets[0],
+        identity[:4],
+        buckets[2],
+        buckets[3],
+        identity[4:],
+        buckets[4],
+        buckets[5],
+        buckets[6],
+        buckets[7],
     )
     return prompt_info
+
+
+def prioritize_story_negative_tags(settings):
+    """Put story-specific failure modes before generic negatives."""
+    tags = split_prompt_tags(settings.get("negative_prompt", ""))
+    priority_order = (
+        "multiple girls",
+        "2girls",
+        "duplicate",
+        "multiple views",
+        "character sheet",
+        "solid color background",
+        "blue background",
+        "tall body",
+        "long legs",
+        "curvy",
+        "large breasts",
+        "wide hips",
+        "side bun",
+        "twin buns",
+        "shushing",
+        "earrings on both ears",
+        "worst quality",
+        "bad anatomy",
+        "bad hands",
+        "extra fingers",
+        "text",
+        "watermark",
+    )
+    by_name = {tag.lower(): tag for tag in tags}
+    prioritized = [
+        by_name[name]
+        for name in priority_order
+        if name in by_name
+    ]
+    prioritized_names = {tag.lower() for tag in prioritized}
+    settings["negative_prompt"] = join_unique_tags(
+        prioritized,
+        [tag for tag in tags if tag.lower() not in prioritized_names],
+    )
+    return settings
 
 
 def apply_source_scene_exclusion(settings, source_scene_prompt, target_scene_prompt):
@@ -1223,7 +1547,49 @@ def apply_event_instruction_constraints(prompt_info, original_prompt, settings):
         value,
         re.IGNORECASE,
     ))
-    if not requests_peace_sign:
+    requests_full_body = bool(re.search(
+        r"(?:全身|足元まで|\bfull body\b|\bhead to toe\b)",
+        value,
+        re.IGNORECASE,
+    ))
+    requests_smile = bool(re.search(
+        r"(?:笑顔|微笑|笑って|\bsmil(?:e|ing)\b)",
+        value,
+        re.IGNORECASE,
+    ))
+    requests_viewer_gaze = bool(re.search(
+        r"(?:こちらを見|こっちを見|カメラ目線|\blooking at (?:the )?viewer\b)",
+        value,
+        re.IGNORECASE,
+    ))
+    requests_right_hand = bool(re.search(
+        r"(?:右手|\bright hand\b)",
+        value,
+        re.IGNORECASE,
+    ))
+    requests_through_fingers = bool(re.search(
+        r"(?:ピースサイン.{0,20}(?:間|あいだ).{0,12}(?:目|のぞ)|"
+        r"(?:目|eye).{0,20}(?:ピースサイン|peace sign|fingers)|"
+        r"\blooking through fingers\b|\beye visible through fingers\b)",
+        value,
+        re.IGNORECASE,
+    ))
+    requests_glass_apple_earring = bool(re.search(
+        r"(?:ガラス.{0,8}(?:林檎|りんご|リンゴ).{0,8}(?:ピアス|イヤリング)|"
+        r"(?:ピアス|イヤリング).{0,8}ガラス.{0,8}(?:林檎|りんご|リンゴ)|"
+        r"\bglass apple (?:earring|earrings)\b)",
+        value,
+        re.IGNORECASE,
+    ))
+    if not any((
+        requests_peace_sign,
+        requests_full_body,
+        requests_smile,
+        requests_viewer_gaze,
+        requests_right_hand,
+        requests_through_fingers,
+        requests_glass_apple_earring,
+    )):
         return prompt_info
 
     existing_tags = [
@@ -1231,18 +1597,28 @@ def apply_event_instruction_constraints(prompt_info, original_prompt, settings):
         for tag in re.split(r"[,\n]", prompt_info["prompt"])
         if tag.strip()
     ]
+    requested_tags = []
+    if requests_full_body:
+        requested_tags.append("full body")
+    if requests_smile:
+        requested_tags.append("smile")
+    if requests_viewer_gaze:
+        requested_tags.append("looking at viewer")
+    if requests_right_hand:
+        requested_tags.append("right hand")
+    if requests_peace_sign:
+        # A single weighted tag expresses the peace sign, eye position, and
+        # hand-near-face composition without crowding out the requested scene.
+        requested_tags.append("(v over eye:1.4)")
+    if requests_glass_apple_earring:
+        requested_tags.append("single glass apple earring")
     prompt_info["prompt"] = join_unique_tags(
-        (
-            "(v over eye:1.4)",
-            "(v:1.3)",
-            "peace sign",
-            "hand beside face",
-        ),
+        requested_tags,
         existing_tags,
     )
-    settings["negative_prompt"] = join_unique_tags(
-        settings["negative_prompt"].split(","),
-        (
+    negative_tags = []
+    if requests_peace_sign:
+        negative_tags.extend((
             "hands under chin",
             "both hands on cheeks",
             "clasped hands",
@@ -1255,11 +1631,17 @@ def apply_event_instruction_constraints(prompt_info, original_prompt, settings):
             "fingers to cheeks",
             "poking cheeks",
             "hands on cheeks",
-        ),
-    )
+        ))
+    if requests_glass_apple_earring:
+        negative_tags.append("earrings on both ears")
+    if negative_tags:
+        settings["negative_prompt"] = join_unique_tags(
+            settings["negative_prompt"].split(","),
+            negative_tags,
+        )
     prompt_info["intent_notes"] = (
-        f"{prompt_info.get('intent_notes', '')} Explicit face-level peace-sign gesture "
-        "was expanded into model-facing pose tags."
+        f"{prompt_info.get('intent_notes', '')} Explicit character actions, framing, "
+        "gaze, and accessories were preserved with deterministic model-facing tags."
     ).strip()
     return prompt_info
 
@@ -1779,6 +2161,23 @@ def api_generate_start():
     )
 
     settings = normalize_generation_settings(data)
+    batch_count = (
+        clamp_int(data.get("batch_count"), 1, 1, 8)
+        if mode == "t2i"
+        else 1
+    )
+    auto_portrait_full_body = (
+        mode == "t2i"
+        and generation_intent in {"story_illustration", "consistent_regeneration"}
+        and apply_story_composition_defaults(
+            settings,
+            "\n".join(
+                value
+                for value in (character_prompt, scene_prompt, prompt)
+                if value
+            ),
+        )
+    )
     refine_enabled = bool(data.get("refine_enabled", True))
     lock_character_outfit = bool(data.get(
         "lock_character_outfit",
@@ -1997,7 +2396,27 @@ def api_generate_start():
                     ),
                     settings,
                 )
+                prompt_info = apply_story_scene_constraints(
+                    prompt_info,
+                    scene_prompt if generation_intent == "story_illustration" else prompt,
+                )
+                prompt_info = apply_story_subject_constraints(
+                    prompt_info,
+                    settings,
+                    "\n".join(
+                        value
+                        for value in (character_prompt, scene_prompt, prompt)
+                        if value
+                    ),
+                    selected_character_lora,
+                )
                 prompt_info = prioritize_consistent_story_tags(prompt_info)
+                if auto_portrait_full_body:
+                    prompt_info["intent_notes"] = (
+                        f"{prompt_info.get('intent_notes', '')} "
+                        "The square default canvas was changed to 768x1152 because "
+                        "the request explicitly requires a full-body story illustration."
+                    ).strip()
             if (
                 selected_character_lora or selected_style_lora
             ) and mode == "t2i":
@@ -2055,6 +2474,11 @@ def api_generate_start():
                         "Training-set constants suppressed: "
                         f"{', '.join(dict.fromkeys(leakage_exclusions))}."
                     )
+            if mode == "t2i" and generation_intent in {
+                "story_illustration",
+                "consistent_regeneration",
+            }:
+                prioritize_story_negative_tags(settings)
             if reference_image_b64 and mode == "t2i":
                 prompt_info["intent_notes"] = (
                     f"{prompt_info.get('intent_notes', '')} "
@@ -2070,8 +2494,16 @@ def api_generate_start():
                 "source": prompt_info.get("source", ""),
             })
 
+            progress_state = {"image_index": 1}
+
             def progress(step, total):
-                q.put({"type": "progress", "step": step + 1, "total": total})
+                q.put({
+                    "type": "progress",
+                    "step": step + 1,
+                    "total": total,
+                    "image_index": progress_state["image_index"],
+                    "image_total": batch_count,
+                })
 
             with _GEN_LOCK:
                 if mode == "edit":
@@ -2224,6 +2656,14 @@ def api_generate_start():
                     # model's quality suffix. The pipeline still uses 77-token
                     # CLIP windows even when its long-prompt helper is enabled.
                     fitted_prompt = fit_prompt_for_sdxl(_STATE["janku_pipe"], prompt_info["prompt"])
+                    if generation_intent in {
+                        "story_illustration",
+                        "consistent_regeneration",
+                    }:
+                        settings["negative_prompt"] = fit_prompt_for_sdxl(
+                            _STATE["janku_pipe"],
+                            settings["negative_prompt"],
+                        )
                     if fitted_prompt != prompt_info["prompt"]:
                         prompt_info["prompt"] = fitted_prompt
                         q.put({
@@ -2231,20 +2671,45 @@ def api_generate_start():
                             "phase": "generate",
                             "message": "重要な要素と品質タグを優先し、モデルに収まる長さへ最適化しました",
                         })
-                    image = generate_with_janku(
-                        _STATE["janku_pipe"],
-                        prompt_info["prompt"],
-                        settings,
-                        callback=progress,
-                        reference_image=reference_image,
-                    )
-                    image = apply_image_style_tone(image, settings)
+                    for image_index, image_seed in enumerate(
+                        batch_generation_seeds(settings["seed"], batch_count),
+                        start=1,
+                    ):
+                        progress_state["image_index"] = image_index
+                        image_settings = {**settings, "seed": image_seed}
+                        if batch_count > 1:
+                            q.put({
+                                "type": "status",
+                                "phase": "generate",
+                                "message": (
+                                    f"{image_index} / {batch_count} 枚目を順番に生成しています"
+                                ),
+                                "image_index": image_index,
+                                "image_total": batch_count,
+                            })
+                        image = generate_with_janku(
+                            _STATE["janku_pipe"],
+                            prompt_info["prompt"],
+                            image_settings,
+                            callback=progress,
+                            reference_image=reference_image,
+                        )
+                        image = apply_image_style_tone(image, image_settings)
+                        if batch_count > 1:
+                            image_buffer = io.BytesIO()
+                            image.save(image_buffer, format="PNG")
+                            q.put({
+                                "type": "batch_image",
+                                "image": base64.b64encode(
+                                    image_buffer.getvalue()
+                                ).decode("ascii"),
+                                "settings": image_settings,
+                                "image_index": image_index,
+                                "image_total": batch_count,
+                            })
 
-            buf = io.BytesIO()
-            image.save(buf, format="PNG")
-            q.put({
+            done_event = {
                 "type": "done",
-                "image": base64.b64encode(buf.getvalue()).decode("ascii"),
                 "original_prompt": prompt,
                 "free_prompt": free_prompt or None,
                 "catalog_prompt": catalog_prompt or None,
@@ -2356,7 +2821,15 @@ def api_generate_start():
                 ],
                 "refine_enabled": refine_enabled,
                 "workflow": workflow,
-            })
+                "batch_count": batch_count,
+            }
+            if batch_count == 1:
+                image_buffer = io.BytesIO()
+                image.save(image_buffer, format="PNG")
+                done_event["image"] = base64.b64encode(
+                    image_buffer.getvalue()
+                ).decode("ascii")
+            q.put(done_event)
         except Exception as exc:
             traceback.print_exc()
             q.put({"type": "error", "message": str(exc)})

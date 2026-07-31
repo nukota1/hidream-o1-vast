@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ app_name }}</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='app.css', v='20260728-assets1') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css', v='20260731-batch1') }}">
 </head>
 <body>
   <header class="topbar">
@@ -173,6 +173,12 @@
           </div>
         </details>
 
+        <div class="field batch-count-field">
+          <label for="character-batch-count">生成枚数</label>
+          <input id="character-batch-count" type="number" min="1" max="8" value="1" step="1">
+          <small>1枚ずつ順番に生成します。2枚目以降はSeedだけを変え、画風・構図設定は維持します。</small>
+        </div>
+
         <button id="generate-character" class="primary-command" type="button">一枚絵を生成</button>
       </section>
 
@@ -297,6 +303,12 @@
           </div>
         </details>
 
+        <div id="compose-batch-count-field" class="field batch-count-field">
+          <label for="compose-batch-count">生成枚数</label>
+          <input id="compose-batch-count" type="number" min="1" max="8" value="1" step="1">
+          <small>一貫再生成を1枚ずつ実行し、Seedだけを変えます。局所修正では1枚固定です。</small>
+        </div>
+
         <div id="edit-history" class="edit-history"></div>
         <button id="generate-compose" class="primary-command" type="button">同じキャラクターで再生成</button>
       </section>
@@ -386,7 +398,9 @@
 
       <section id="result" hidden>
         <div id="result-workflow-label" class="result-workflow-label"></div>
-        <div class="image-stage"><img id="result-image" alt="生成画像"></div>
+        <div id="batch-result-summary" class="batch-result-summary" hidden></div>
+        <div id="result-batch-grid" class="result-batch-grid" hidden></div>
+        <div id="result-single-stage" class="image-stage"><img id="result-image" alt="生成画像"></div>
         <div class="result-toolbar">
           <button id="use-result-in-compose" type="button" hidden>この画像を参照して再生成</button>
           <button id="download" type="button">画像を保存</button>
@@ -538,6 +552,6 @@
   </dialog>
 
   <script id="preset-data" type="application/json">{{ presets_json|safe }}</script>
-  <script src="{{ url_for('static', filename='app.js', v='20260729-zero-dual-lora1') }}"></script>
+  <script src="{{ url_for('static', filename='app.js', v='20260731-batch1') }}"></script>
 </body>
 </html>

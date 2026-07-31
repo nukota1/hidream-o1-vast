@@ -250,6 +250,12 @@ button:disabled { cursor: wait; opacity: .58; }
 
 #result { max-width: 1120px; margin: 0 auto; }
 .result-workflow-label { margin-bottom: 8px; color: var(--muted); font-size: 12px; font-weight: 700; }
+.batch-result-summary { margin-bottom: 10px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.result-batch-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+.batch-result-card { min-width: 0; display: grid; gap: 8px; padding: 8px; text-align: left; background: #fff; }
+.batch-result-card[aria-pressed="true"] { border-color: var(--blue); box-shadow: 0 0 0 2px rgba(23, 105, 224, .16); }
+.batch-result-card img { width: 100%; height: min(48vh, 460px); display: block; object-fit: contain; background: #eef0f3; pointer-events: none; }
+.batch-result-card span { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 .image-stage { display: flex; justify-content: center; background: #eef0f3; border: 1px solid var(--border); min-height: 420px; }
 .image-stage img { display: block; max-width: 100%; max-height: 78vh; object-fit: contain; }
 .result-toolbar { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; padding: 12px 0; }
@@ -358,5 +364,7 @@ button:disabled { cursor: wait; opacity: .58; }
   .gallery-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
   .gallery-preview-body { grid-template-columns: 1fr; }
   .lora-training-layout { grid-template-columns: 1fr; }
+  .result-batch-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .batch-result-card img { height: min(34vh, 300px); }
   .result-toolbar > * { flex: 1; }
 }
