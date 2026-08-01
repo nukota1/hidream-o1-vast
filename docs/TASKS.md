@@ -142,9 +142,16 @@
 
 ### T-003 最新Vast.aiイメージの起動確認
 
-- ステータス: `todo`
+- ステータス: `in_progress`
 - 優先度: 高
 - 完了条件: 最新UI、モデル準備、Flask起動、参照生成、通常生成をVast.aiで確認する
+- 2026-08-01 公開準備:
+  - ローカル評価画像の `output/` を `.dockerignore` へ追加し、公開イメージへ混入しないよう修正した
+  - コミット `c8233dcaba06d4cf180bd31e9bc8006b191faf34` からVast.ai用イメージをビルドした
+  - `nukota0615/hidream-o1-image:c8233dcaba06d4cf180bd31e9bc8006b191faf34` をDocker Hubへ公開した
+  - 公開digestは `sha256:f9f6df2467bb58725f677005c19a957a61aac98ac79cc2be184a64a1ab3ab44b`、platformは `linux/amd64`
+  - GHCRへの同タグ公開はローカル認証切れで未実施。Vast.aiでは公開済みDocker Hubタグを使用できる
+  - ユーザー方針により、現在のローカルマシンと同等のVast.ai構成を後日選定する。インスタンス作成と課金は未実施
 
 ### T-004 Worker・Vast.ai・R2・D1のend-to-end確認
 
@@ -152,6 +159,7 @@
 - 優先度: 高
 - 依存: T-003
 - 完了条件: Worker経由の生成、履歴、画像保存、フォルダ、お気に入り、ユーザー分離を確認する
+- 2026-08-01: ローカル環境のCloudflare APIトークンは失効しており、Vast URL確定後のWorker更新前にWebログインまたは新しい限定スコープトークンが必要
 
 ### T-005 Worker依存の脆弱性調査
 

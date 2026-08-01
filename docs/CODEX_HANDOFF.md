@@ -335,6 +335,12 @@ Character LoRAの評価後に、Style LoRA用50枚以上、T-015のOpenPose、Va
 - 引き継ぎ更新前のHEAD: `2d459da60b3c45730e5f2767054f10ef6d833e33`
 - Zero統一、LoRA互換性保護、Character/Style同時適用はローカル開発環境へ実装済み
 - Vast.ai本番反映、Cloudflare反映は未実施
+- 2026-08-01にローカル評価画像の `output/` をDocker build対象外へ修正し、`c8233dcaba06d4cf180bd31e9bc8006b191faf34` をpushした
+- Vast.ai用Docker Hubタグは `nukota0615/hidream-o1-image:c8233dcaba06d4cf180bd31e9bc8006b191faf34`
+- 公開digestは `sha256:f9f6df2467bb58725f677005c19a957a61aac98ac79cc2be184a64a1ab3ab44b`、platformは `linux/amd64`
+- GHCRはローカル認証切れのため同タグ未公開。Vast.aiではDocker Hubタグを使用する
+- Vast.aiインスタンスは未契約。ユーザーがローカル同等構成を後日選定するため、課金・起動確認・Worker接続を保留している
+- ローカル環境のCloudflare APIトークンは失効しており、Workerの `BACKEND_URL` 更新前に再認証が必要
 - `input/` はGit管理外。教師画像36枚はローカルにだけ存在する
 - `output/t017-zero-lora/` はGitへ未追加。比較画像と評価記録は現在ローカルにだけ存在する
 - T-017のcaption・ステージング・比較画像はローカル資産として維持し、T-018とT-019のソース・テスト・管理文書はこのブランチへcommit・pushする
