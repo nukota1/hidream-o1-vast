@@ -1,6 +1,6 @@
 # Tasks
 
-最終更新: 2026-07-31 (JST)
+最終更新: 2026-08-03 (JST)
 
 ステータスは `todo`、`in_progress`、`blocked`、`done` を使用する。
 
@@ -152,6 +152,7 @@
   - 公開digestは `sha256:f9f6df2467bb58725f677005c19a957a61aac98ac79cc2be184a64a1ab3ab44b`、platformは `linux/amd64`
   - GHCRへの同タグ公開はローカル認証切れで未実施。Vast.aiでは公開済みDocker Hubタグを使用できる
   - ユーザー方針により、現在のローカルマシンと同等のVast.ai構成を後日選定する。インスタンス作成と課金は未実施
+- 2026-08-03: 構成選定を再開した。ローカルはRTX 5090・約32GB VRAMで、Vast.aiのログイン・残高確認後に候補を比較する
 
 ### T-004 Worker・Vast.ai・R2・D1のend-to-end確認
 
@@ -159,7 +160,12 @@
 - 優先度: 高
 - 依存: T-003
 - 完了条件: Worker経由の生成、履歴、画像保存、フォルダ、お気に入り、ユーザー分離を確認する
-- 2026-08-01: ローカル環境のCloudflare APIトークンは失効しており、Vast URL確定後のWorker更新前にWebログインまたは新しい限定スコープトークンが必要
+- 2026-08-03 Cloudflare事前確認:
+  - 新しいアカウントAPIトークンがactiveで、Worker、R2、D1の既存リソースを読み取れることを確認した
+  - 新しいR2 S3認証で画像バケットとモデルキャッシュの読み取りに成功した
+  - 既存WorkerのR2・D1・Access・Backend bindingと、D1のgallery用テーブルを確認した
+  - 現在の `BACKEND_SHARED_SECRET` は `plain_text` bindingのため、Vast URL確定後の再デプロイでWorker Secretへ置き換える
+  - 検証用APIトークンとR2 S3キーは本番稼働前にローテーションする
 
 ### T-005 Worker依存の脆弱性調査
 

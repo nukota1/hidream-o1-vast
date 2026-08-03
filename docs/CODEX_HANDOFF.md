@@ -339,8 +339,12 @@ Character LoRAの評価後に、Style LoRA用50枚以上、T-015のOpenPose、Va
 - Vast.ai用Docker Hubタグは `nukota0615/hidream-o1-image:c8233dcaba06d4cf180bd31e9bc8006b191faf34`
 - 公開digestは `sha256:f9f6df2467bb58725f677005c19a957a61aac98ac79cc2be184a64a1ab3ab44b`、platformは `linux/amd64`
 - GHCRはローカル認証切れのため同タグ未公開。Vast.aiではDocker Hubタグを使用する
-- Vast.aiインスタンスは未契約。ユーザーがローカル同等構成を後日選定するため、課金・起動確認・Worker接続を保留している
-- ローカル環境のCloudflare APIトークンは失効しており、Workerの `BACKEND_URL` 更新前に再認証が必要
+- Vast.aiインスタンスは未契約。2026-08-03にローカルのRTX 5090・約32GB VRAM相当の構成選定を再開し、Vast.aiのログイン・残高確認を待っている
+- 2026-08-03に新しいCloudflareアカウントAPIトークンがactiveであり、Worker、R2、D1の読み取りに成功した
+- 新しいR2 S3認証で画像バケットとモデルキャッシュの読み取りに成功した。S3 endpointはCloudflare公式のアカウントID形式を使用する
+- 既存WorkerのR2・D1・Access・Backend bindingとD1テーブルを確認したが、デプロイは2026-07-22のままである
+- 現在の `BACKEND_SHARED_SECRET` は `plain_text` bindingのため、Vast URL確定後にWorker Secretとして再設定する
+- 検証用のCloudflare APIトークンとR2 S3キーは本番稼働前にローテーションする。値はGit・文書へ保存しない
 - `input/` はGit管理外。教師画像36枚はローカルにだけ存在する
 - `output/t017-zero-lora/` はGitへ未追加。比較画像と評価記録は現在ローカルにだけ存在する
 - T-017のcaption・ステージング・比較画像はローカル資産として維持し、T-018とT-019のソース・テスト・管理文書はこのブランチへcommit・pushする

@@ -1,6 +1,6 @@
 # Project Status
 
-最終更新: 2026-07-31 (JST)
+最終更新: 2026-08-03 (JST)
 
 ## 現在の目標
 
@@ -107,6 +107,9 @@
 - 2026-07-31の終了確認で自動テスト57件、Python構文、Docker buildが成功
 - 2026-08-01に `output/` をDockerビルド対象外へ修正し、コミット `c8233dc` のVast.ai用イメージをDocker Hubへ公開
 - 公開タグ `nukota0615/hidream-o1-image:c8233dcaba06d4cf180bd31e9bc8006b191faf34`、digest `sha256:f9f6df2467bb58725f677005c19a957a61aac98ac79cc2be184a64a1ab3ab44b`、platform `linux/amd64` をリモート確認
+- 2026-08-03に新しいCloudflareアカウントAPIトークンがactiveであり、Worker、R2、D1の既存リソースを読み取れることを確認
+- 新しいR2 S3認証で `hidream-o1-generated-images` と `ai-model-cache` の読み取りに成功
+- 既存WorkerにR2・D1・Access・Backendの各binding、D1にgallery用テーブルが存在することを確認
 
 ## 既知の制約
 
@@ -127,8 +130,9 @@
 - テキストだけではガラスの林檎のピアスなど小さな装飾を毎回視認可能な形で保証できない。最終promptへは保持するが、再現率はLoRA・学習データ・解像度にも依存する
 - LoRA＋参照25%は外見維持が強い一方、元ポーズや靴の要素を少し引き継ぐ。ポーズ優先時は参照20%を推奨
 - 最新コードのVast.ai起動とCloudflare Worker・R2・D1を含むend-to-end検証は未実施
-- Vast.aiインスタンスは未契約。現在のローカルマシンと同等の構成を後日選定するため、課金・起動確認を保留している
-- ローカル環境のCloudflare APIトークンは失効しており、Worker更新前に再認証が必要
+- Vast.aiインスタンスは未契約。ローカルのRTX 5090・約32GB VRAM相当の構成選定を再開し、Vast.aiのログイン・残高確認を待っている
+- Cloudflareの検証用認証は利用可能。本番稼働前にAPIトークンとR2 S3キーをローテーションする
+- 現在デプロイ済みの `BACKEND_SHARED_SECRET` bindingは `plain_text` のため、次回Workerデプロイ時にWorker Secretへ置き換える
 - Vast.ai側でPython/CUDA依存を永続ディスクへ保存するか、依存込みイメージとの起動時間・転送量を比較する必要がある
 - 旧クロマ・人物抽出コードは既存資産と手動処理の互換用に残っているが、標準UIからは実行しない
 
