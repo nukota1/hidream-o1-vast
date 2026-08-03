@@ -114,6 +114,8 @@
 - 既存WorkerにR2・D1・Access・Backendの各binding、D1にgallery用テーブルが存在することを確認
 - 2026-08-03のVast現行モデル限定化後、自動テスト57件、主要Python 5ファイルとBashの構文、Docker Compose設定、Vast用Docker buildが成功
 - 再ビルドしたVast用イメージにローカル `docs/KEYS.md` と `output/` が含まれず、HiDream runtime既定無効とJANKU環境変数除外が反映されることを確認
+- 現行モデル限定コミット `4b7d43c33ce7452cd4a7cb9e6da90011d9d6840f` のVast.ai用イメージをDocker Hubへ公開
+- 公開タグ `nukota0615/hidream-o1-image:4b7d43c33ce7452cd4a7cb9e6da90011d9d6840f`、digest `sha256:14ef1788ac1b8dcc632906e065cd60274248e0114a8a918be8319865ca053df5`、実行platform `linux/amd64` をリモート確認
 
 ## 既知の制約
 

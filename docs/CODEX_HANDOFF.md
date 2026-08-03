@@ -350,6 +350,7 @@ Character LoRAの評価後に、Style LoRA用50枚以上、T-015のOpenPose、Va
 - 現在の `BACKEND_SHARED_SECRET` は `plain_text` bindingのため、Vast URL確定後にWorker Secretとして再設定する
 - 検証用のCloudflare APIトークンとR2 S3キーは本番稼働前にローテーションする。値はGit・文書へ保存しない
 - 2026-08-03にVast.aiテンプレートとCloudflare環境変数の設定が完了し、現在使用中の3モデル系統だけを準備する起動構成へソースと環境変数例を変更した。新しいSHA固定イメージのVast実機起動はユーザーが行う
+- 現行モデル限定イメージは `nukota0615/hidream-o1-image:4b7d43c33ce7452cd4a7cb9e6da90011d9d6840f`。リモートdigestは `sha256:14ef1788ac1b8dcc632906e065cd60274248e0114a8a918be8319865ca053df5`、実行platformは `linux/amd64`
 - `input/` はGit管理外。教師画像36枚はローカルにだけ存在する
 - `output/t017-zero-lora/` はGitへ未追加。比較画像と評価記録は現在ローカルにだけ存在する
 - T-017のcaption・ステージング・比較画像はローカル資産として維持し、T-018とT-019のソース・テスト・管理文書はこのブランチへcommit・pushする
