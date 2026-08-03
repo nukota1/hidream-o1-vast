@@ -199,7 +199,9 @@
   - 残作業は参照画像あり生成と、T-020のLoRA復元を含む最新イメージの確認
   - T-020イメージではLoRA一覧への復元に成功したが、Animagine本体が0 bytesのまま生成待機した。Qwen取得ログにはHugging Face Xet/CASの応答デコードエラーが記録されていた
   - Xet/CASを既定で無効にし、通常HTTP取得を最大5回再試行する起動処理と、最終失敗を生成要求へ即時通知するマーカーをローカル実装した
-  - 自動テスト66件、Python・Bash構文、Compose設定、Vast用Docker buildに成功。修正版Dockerイメージの公開とVast.ai再確認は未実施
+  - 自動テスト66件、Python・Bash構文、Compose設定、Vast用Docker buildに成功
+  - 修正コミット `45e2bca2bc9a27fdb475c75fac2700ae7d50c4a7` と同SHAのDocker Hubイメージを公開し、digest `sha256:98f4ff43961d91d8b5e4c034e259df10354e7c52246e64b55cdffbf052133c30`、`linux/amd64` manifestを確認した
+  - 残作業は修正版イメージのVast.ai再デプロイ、モデル取得完了、LoRA選択生成、参照画像あり生成の確認
 
 ### T-004 Worker・Vast.ai・R2・D1のend-to-end確認
 
@@ -239,6 +241,7 @@
   - ローカル秘密情報ファイルと評価用 `output/` がビルド済みイメージへ含まれないことを確認した
   - Vast実機でHugging Face Xet/CASの応答デコードエラーを確認したため、`HF_HUB_DISABLE_XET=1`、120秒のdownload timeout、最大5回の段階的再試行を標準化した
   - Animagine取得が全試行で失敗した場合は失敗マーカーを保存し、生成要求が2時間待機せず原因を返すようにした
+  - 再試行修正版をコミット `45e2bca2bc9a27fdb475c75fac2700ae7d50c4a7` のDocker Hubイメージとして公開した
 - 残作業:
   - 再試行修正版のSHA固定イメージをVast.aiで起動し、Animagine・IP-Adapter・Qwenの取得完了とfresh diskの所要時間を実測する
   - Vast.aiの永続ディスクで同等の依存キャッシュを採用するか、イメージサイズと比較する

@@ -2,7 +2,7 @@
 
 最終更新: 2026-08-03 (JST)
 
-この文書は次のチャットの開始地点である。Zero用Character LoRAをCloudflare Access利用者ownerへ移行し、Vast.aiの一覧へ復元するところまで完了した。LoRA選択生成はAnimagine本体のHugging Face取得障害で止まったため、Xet/CAS回避、最大5回再試行、失敗通知をローカル実装し、66テストと構文確認に成功した。修正版のネット公開とVast.ai再確認が次の作業である。Character LoRA自体はcheckpoint 720が正面の瞳と猫型髪飾り、600が背面のお団子に優れるが、単一重みで全条件を満たさないためT-017は未完了。
+この文書は次のチャットの開始地点である。Zero用Character LoRAをCloudflare Access利用者ownerへ移行し、Vast.aiの一覧へ復元するところまで完了した。LoRA選択生成はAnimagine本体のHugging Face取得障害で止まったため、Xet/CAS回避、最大5回再試行、失敗通知を実装し、66テストと構文確認後にGitHub・Docker Hubへ公開した。修正版のVast.ai再確認が次の作業である。Character LoRA自体はcheckpoint 720が正面の瞳と猫型髪飾り、600が背面のお団子に優れるが、単一重みで全条件を満たさないためT-017は未完了。
 
 ## 1. 現在の目的
 
@@ -331,14 +331,14 @@ Node.jsが実行コンテナにない場合は、Nodeを含む既存ビルド環
 
 2026-08-03のT-020確認では、ユーザー別R2同期を含む自動テスト64件、変更Pythonファイルの構文、Compose設定、Docker buildが成功した。ビルド済みイメージに同期コードと移行CLIが含まれ、`docs/KEYS.md` と `output/` が含まれないことも確認した。現在のZero Character LoRAはR2の `local` ownerへ推論重みと学習設定の2成果物、93,065,511 bytesとして保存し、中間checkpoint 4件を整理した。空の一時ストアへ1モデルを復元し、サイズ・SHA-256検証にも成功した。Cloudflare Access利用者ownerとVast.aiを使う復元・生成は未実施。
 
-その後、Cloudflare Access利用者ownerへの移行とVast.ai一覧への復元までは成功した。LoRA選択生成はAnimagine本体の取得失敗で止まり、QwenログにはXet/CASの応答デコードエラーがあった。再試行・失敗通知修正後の確認では自動テスト66件、Python構文、Bash構文、Compose設定、Vast用Docker buildが成功した。修正版Dockerイメージの公開とVast.aiでの取得・生成再確認は未実施。
+その後、Cloudflare Access利用者ownerへの移行とVast.ai一覧への復元までは成功した。LoRA選択生成はAnimagine本体の取得失敗で止まり、QwenログにはXet/CASの応答デコードエラーがあった。再試行・失敗通知修正後の確認では自動テスト66件、Python構文、Bash構文、Compose設定、Vast用Docker buildが成功した。修正版はGitHub・Docker Hubへ公開済みで、Vast.aiでの取得・生成再確認は未実施。
 
 ## 10. 次に行うこと
 
 Vast.aiモデル取得修正版の公開とT-020の生成確認を先に行い、その後にT-017を次の順で続ける。
 
 1. `AGENTS.md`、この文書、`PROJECT_STATUS.md`、`TASKS.md`、`DECISIONS.md`を読む
-2. Hugging Face取得再試行修正版をGitHubとDocker Hubへ公開し、Vast.aiテンプレートを新しいSHA固定タグへ更新する
+2. Vast.aiテンプレートをHugging Face取得再試行修正版のSHA固定タグへ更新する
 3. Vast.aiログでAnimagine本体、IP-Adapter、Qwenの取得完了を確認する
 4. 復元済みZero Character LoRAを選択して生成を確認する
 5. `output/t017-zero-lora/EVALUATION_SUMMARY.md` と5つの比較フォルダを確認する
@@ -356,7 +356,7 @@ Cloudflare Access利用者ownerへのLoRA移行とVast.ai復元は完了した�
 - ブランチ: `codex/animagine-zero-dual-lora`
 - 今回のVast構成整理前のHEAD: `e84a7a6490d7fc74b0e4dd5acc7432ad61f27aad`
 - Zero統一、LoRA互換性保護、Character/Style同時適用はローカル開発環境へ実装済み
-- Vast.aiとCloudflareは検証環境へ反映済み。Hugging Face取得再試行修正版のVast.ai反映は未実施
+- Vast.aiとCloudflareは検証環境へ反映済み。Hugging Face取得再試行修正版はネット公開済みで、Vast.ai反映は未実施
 - 2026-08-01にローカル評価画像の `output/` をDocker build対象外へ修正し、`c8233dcaba06d4cf180bd31e9bc8006b191faf34` をpushした
 - Vast.ai用Docker Hubタグは `nukota0615/hidream-o1-image:c8233dcaba06d4cf180bd31e9bc8006b191faf34`
 - 公開digestは `sha256:f9f6df2467bb58725f677005c19a957a61aac98ac79cc2be184a64a1ab3ab44b`、platformは `linux/amd64`
@@ -373,7 +373,8 @@ Cloudflare Access利用者ownerへのLoRA移行とVast.ai復元は完了した�
 - T-020のユーザー別LoRA R2同期とcheckpoint除外修正は `9b1f096ce4ca5ad4e54871bba7b095f603b41479` としてGitHubへpush済み
 - 同コミットのDocker Hubタグは `nukota0615/hidream-o1-image:9b1f096ce4ca5ad4e54871bba7b095f603b41479`、リモートdigestは `sha256:196e8377cf1a5ad0969ec042b74a086a03087ad9759e241203a1980363915f02`、実行platformは `linux/amd64`
 - Zero LoRAはCloudflare Access利用者ownerへ移行し、Vast.ai一覧への復元済み。LoRA適用生成はAnimagine本体の取得障害により未完了
-- Hugging Face Xet/CAS回避、最大5回再試行、失敗通知はローカル実装・66テスト成功済み。GitHub・Docker Hub公開前
+- Hugging Face Xet/CAS回避、最大5回再試行、失敗通知はコミット `45e2bca2bc9a27fdb475c75fac2700ae7d50c4a7` としてGitHubへpush済み
+- 同SHAのDocker Hubイメージを公開し、digest `sha256:98f4ff43961d91d8b5e4c034e259df10354e7c52246e64b55cdffbf052133c30`、実行platform `linux/amd64` を確認済み
 - `input/` はGit管理外。教師画像36枚はローカルにだけ存在する
 - `output/t017-zero-lora/` はGitへ未追加。比較画像と評価記録は現在ローカルにだけ存在する
 - T-017のcaption・ステージング・比較画像はローカル資産として維持し、T-018とT-019のソース・テスト・管理文書はこのブランチへcommit・pushする

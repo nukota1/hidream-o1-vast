@@ -131,6 +131,7 @@
 - Cloudflare Access利用者ownerへZero Character LoRAを移行し、Vast.aiのLoRA一覧で1件を互換・readyとして復元できることを確認
 - 同LoRAでのVast.ai生成時、Animagine本体が0 bytesのまま待機し、Qwen取得もHugging Face Xet/CASの応答デコードエラーで失敗していたことを確認
 - Xet/CASを回避する通常HTTP取得、最大5回の段階的再試行、最終失敗マーカーを実装し、自動テスト66件、Python・Bash構文、Compose設定、Vast用Docker buildに成功
+- 修正コミット `45e2bca2bc9a27fdb475c75fac2700ae7d50c4a7` をGitHubとDocker Hubへ公開し、digest `sha256:98f4ff43961d91d8b5e4c034e259df10354e7c52246e64b55cdffbf052133c30`、実行platform `linux/amd64` を確認
 
 ## 既知の制約
 
@@ -151,7 +152,7 @@
 - テキストだけではガラスの林檎のピアスなど小さな装飾を毎回視認可能な形で保証できない。最終promptへは保持するが、再現率はLoRA・学習データ・解像度にも依存する
 - LoRA＋参照25%は外見維持が強い一方、元ポーズや靴の要素を少し引き継ぐ。ポーズ優先時は参照20%を推奨
 - Vast.aiでは現行公開イメージの起動と通常生成に成功したが、参照生成およびCloudflare Worker・R2・D1を含むend-to-end検証は未実施
-- Access利用者のZero LoRAはVast.ai一覧へ復元済みだが、ベースモデル取得障害によりLoRA適用生成は未完了。再試行修正版イメージの公開・再デプロイ後に再確認する
+- Access利用者のZero LoRAはVast.ai一覧へ復元済みだが、ベースモデル取得障害によりLoRA適用生成は未完了。公開済み再試行修正版イメージの再デプロイ後に再確認する
 - Cloudflareの検証用認証は利用可能。本番稼働前にAPIトークンとR2 S3キーをローテーションする
 - 現在デプロイ済みの `BACKEND_SHARED_SECRET` bindingは `plain_text` のため、次回Workerデプロイ時にWorker Secretへ置き換える
 - 現在のZero用Character LoRAはGit・公開Dockerイメージに含めず、Cloudflare Access利用者ownerのR2へ保存し、Vast.aiへ復元する
@@ -161,7 +162,7 @@
 
 ## 次の優先作業
 
-1. Hugging Face取得再試行修正版をGitHub・Docker Hubへ公開し、Vast.aiでAnimagine本体とQwenの取得を確認する（T-003、T-008）
+1. Vast.aiテンプレートを公開済み再試行修正版へ更新し、Animagine本体とQwenの取得を確認する（T-003、T-008）
 2. 復元済みZero Character LoRAを選択してVast.aiで生成し、T-020のend-to-end確認を完了する
 3. 正面では後頭部のお団子を常時挿入しない視点依存の人物固定定義を検討する（T-017）
 4. 体格・お団子教師画像の比率、caption、repeat数を見直してZero用Character LoRAを再学習する（T-017）
