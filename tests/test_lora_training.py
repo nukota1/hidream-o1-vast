@@ -18,6 +18,7 @@ from lora_training import (
     validate_training_request,
 )
 from sdxl_janku_workflow import (
+    _wait_for_model_file,
     configure_pipeline_loras,
     configure_pipeline_reference,
     generate_with_janku,
@@ -565,6 +566,35 @@ class LoraTrainingTests(unittest.TestCase):
         cropped = prepare_character_reference(reference)
 
         self.assertEqual(cropped.size, (700, 640))
+
+    def test_model_wait_reports_background_download_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "animagine.safetensors"
+            marker_path = Path(f"{model_path}.download_failed")
+            marker_path.write_text(
+                "Animagine download failed after retries.",
+                encoding="utf-8",
+            )
+
+            with patch("sdxl_janku_workflow.time.sleep") as sleep:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "Animagine download failed after retries",
+                ):
+                    _wait_for_model_file(str(model_path), 100)
+
+            sleep.assert_not_called()
+
+    def test_complete_model_ignores_stale_download_failure_marker(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "animagine.safetensors"
+            model_path.write_bytes(b"complete")
+            Path(f"{model_path}.download_failed").write_text(
+                "stale failure",
+                encoding="utf-8",
+            )
+
+            _wait_for_model_file(str(model_path), len(b"complete"))
 
 
 if __name__ == "__main__":

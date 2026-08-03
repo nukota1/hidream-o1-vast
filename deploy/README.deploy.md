@@ -44,6 +44,13 @@ HiDream source and its extra Python dependencies are also skipped unless
 `HIDREAM_RUNTIME_SETUP_ON_START=1` is explicitly set. `HF_TOKEN` is optional for
 higher Hugging Face download limits.
 
+The standard template sets `HF_HUB_DISABLE_XET=1` because some Vast hosts have
+returned truncated Xet/CAS reconstruction responses for large files. Hugging
+Face downloads use regular HTTP with bounded, resumable retries. If all image
+model retries fail, the backend writes a failure marker and the generation job
+returns an actionable error instead of waiting for the full model-download
+timeout.
+
 Models are stored under `/models`. Mount a persistent volume there when the Vast
 host supports it; otherwise they are downloaded for every new instance.
 

@@ -193,8 +193,18 @@ def _download_if_needed(path, status_callback=None):
 def _wait_for_model_file(path, min_bytes, status_callback=None):
     """Wait for the entrypoint's background Hugging Face download."""
     wait_seconds = int(os.environ.get("MODEL_DOWNLOAD_WAIT_SECONDS", "7200"))
+    failure_marker = f"{path}.download_failed"
     waited = 0
     while not _is_complete_file(path, min_bytes):
+        if os.path.isfile(failure_marker):
+            try:
+                detail = Path(failure_marker).read_text(encoding="utf-8").strip()[:1000]
+            except (OSError, UnicodeError):
+                detail = ""
+            message = "Image model download failed during startup. Check the Vast.ai instance log."
+            if detail:
+                message = f"{message} {detail}"
+            raise RuntimeError(message)
         if waited >= wait_seconds:
             raise RuntimeError(f"Timed out waiting for model download: {path}")
         if status_callback and waited % 10 == 0:

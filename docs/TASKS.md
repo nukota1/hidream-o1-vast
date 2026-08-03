@@ -148,8 +148,10 @@
   - 空の一時ストアへR2から1モデルを復元し、サイズ・SHA-256検証とメタデータ登録に成功した
   - checkpoint除外修正コミット `9b1f096ce4ca5ad4e54871bba7b095f603b41479` をGitHubへpushした
   - 同コミットのDocker Hubイメージを公開し、リモートdigest `sha256:196e8377cf1a5ad0969ec042b74a086a03087ad9759e241203a1980363915f02` と `linux/amd64` manifestを確認した
+  - Cloudflare Access利用者ownerへZero Character LoRAを移行し、Vast.aiの一覧で1件を互換・readyとして復元した
+  - LoRA選択生成はAnimagine本体の起動時取得失敗により未完了。R2同期やLoRA互換性ではなく、ベースモデルが0 bytesのまま存在しないことが直接の阻害要因
 - 残作業:
-  - Cloudflare Access経由のowner keyへ現在のZero Character LoRAを移行し、Vast.aiで復元・生成を確認する
+  - Hugging Face取得再試行修正版をVast.aiへ反映し、復元済みZero Character LoRAで生成を確認する
 
 ### T-015 OpenPose ControlNetによる厳密なポーズ制御
 
@@ -195,6 +197,9 @@
   - リモートdigest `sha256:14ef1788ac1b8dcc632906e065cd60274248e0114a8a918be8319865ca053df5`、実行platform `linux/amd64` を確認した
   - 最初のVastホストではregistry layer展開に失敗したが、別ホストへ変更後は起動と通常イラスト生成に成功した
   - 残作業は参照画像あり生成と、T-020のLoRA復元を含む最新イメージの確認
+  - T-020イメージではLoRA一覧への復元に成功したが、Animagine本体が0 bytesのまま生成待機した。Qwen取得ログにはHugging Face Xet/CASの応答デコードエラーが記録されていた
+  - Xet/CASを既定で無効にし、通常HTTP取得を最大5回再試行する起動処理と、最終失敗を生成要求へ即時通知するマーカーをローカル実装した
+  - 自動テスト66件、Python・Bash構文、Compose設定、Vast用Docker buildに成功。修正版Dockerイメージの公開とVast.ai再確認は未実施
 
 ### T-004 Worker・Vast.ai・R2・D1のend-to-end確認
 
@@ -232,8 +237,10 @@
   - Worker経由のR2保存ではVast側のCloudflare APIトークン・R2 S3認証が不要であることをデプロイ手順へ明記した
   - 自動テスト57件、主要Python 5ファイルとBashの構文、Compose設定、Docker buildが成功した
   - ローカル秘密情報ファイルと評価用 `output/` がビルド済みイメージへ含まれないことを確認した
+  - Vast実機でHugging Face Xet/CASの応答デコードエラーを確認したため、`HF_HUB_DISABLE_XET=1`、120秒のdownload timeout、最大5回の段階的再試行を標準化した
+  - Animagine取得が全試行で失敗した場合は失敗マーカーを保存し、生成要求が2時間待機せず原因を返すようにした
 - 残作業:
-  - 新しいSHA固定イメージをVast.aiで起動し、fresh diskの依存セットアップ時間とモデル取得量を実測する
+  - 再試行修正版のSHA固定イメージをVast.aiで起動し、Animagine・IP-Adapter・Qwenの取得完了とfresh diskの所要時間を実測する
   - Vast.aiの永続ディスクで同等の依存キャッシュを採用するか、イメージサイズと比較する
 
 ### T-016 実用Character LoRAの品質評価

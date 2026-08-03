@@ -47,10 +47,15 @@ fi
 : "${TORCHVISION_VERSION:=0.22.1}"
 : "${PROMPT_REFINER_LOCAL_FILES_ONLY:=1}"
 : "${PROMPT_REFINER_USE_KERNELS:=0}"
+: "${HF_HUB_DISABLE_XET:=1}"
+: "${HF_HUB_DOWNLOAD_TIMEOUT:=120}"
+: "${HF_DOWNLOAD_MAX_ATTEMPTS:=5}"
+: "${HF_DOWNLOAD_RETRY_SECONDS:=20}"
 
 export APP_NAME IMAGE_MODEL_FAMILY IMAGE_MODEL_LABEL IMAGE_MODEL_PROFILE
 export ANIMAGINE_MODEL_REPO ANIMAGINE_MODEL_CONFIG ANIMAGINE_MODEL_FILE ANIMAGINE_MODEL_PATH ANIMAGINE_MODEL_MIN_BYTES
 export HF_HOME U2NET_HOME LORA_ROOT ANIME_SEGMENTATION_MODEL PROMPT_REFINER_LOCAL_FILES_ONLY PROMPT_REFINER_USE_KERNELS
+export HF_HUB_DISABLE_XET HF_HUB_DOWNLOAD_TIMEOUT
 
 pip_install_with_retry() {
   local attempt=1
@@ -63,6 +68,32 @@ pip_install_with_retry() {
     fi
     echo "[entrypoint] pip install interrupted; retrying in $((attempt * 20)) seconds (${attempt}/${max_attempts})."
     sleep "$((attempt * 20))"
+    attempt=$((attempt + 1))
+  done
+}
+
+hf_download_with_retry() {
+  local attempt=1
+  local max_attempts="$HF_DOWNLOAD_MAX_ATTEMPTS"
+  local retry_seconds="$HF_DOWNLOAD_RETRY_SECONDS"
+
+  case "$max_attempts" in
+    ''|*[!0-9]*) max_attempts=5 ;;
+  esac
+  case "$retry_seconds" in
+    ''|*[!0-9]*) retry_seconds=20 ;;
+  esac
+  if [ "$max_attempts" -lt 1 ]; then
+    max_attempts=1
+  fi
+
+  until hf download "$@"; do
+    if [ "$attempt" -ge "$max_attempts" ]; then
+      echo "[entrypoint] Hugging Face download failed after ${max_attempts} attempts."
+      return 1
+    fi
+    echo "[entrypoint] Hugging Face download interrupted; retrying in $((attempt * retry_seconds)) seconds (${attempt}/${max_attempts})."
+    sleep "$((attempt * retry_seconds))"
     attempt=$((attempt + 1))
   done
 }
@@ -162,18 +193,30 @@ animagine_model_ready() {
 }
 
 download_animagine_model() {
+  local failure_marker="${ANIMAGINE_MODEL_PATH}.download_failed"
+  rm -f "$failure_marker"
   if animagine_model_ready; then
     echo "[entrypoint] Animagine model already present: $ANIMAGINE_MODEL_PATH"
     return 0
   fi
   echo "[entrypoint] Downloading $IMAGE_MODEL_LABEL from Hugging Face"
   mkdir -p "$(dirname "$ANIMAGINE_MODEL_PATH")"
-  hf download "$ANIMAGINE_MODEL_REPO" "$ANIMAGINE_MODEL_FILE" \
-    --local-dir "$(dirname "$ANIMAGINE_MODEL_PATH")"
-  if ! animagine_model_ready; then
-    echo "[entrypoint] Animagine download did not produce a complete model file."
+  if ! hf_download_with_retry "$ANIMAGINE_MODEL_REPO" "$ANIMAGINE_MODEL_FILE" \
+    --local-dir "$(dirname "$ANIMAGINE_MODEL_PATH")"; then
+    printf '%s\n' \
+      "Animagine download failed after retries. Check the Vast.ai instance log and Hugging Face connectivity." \
+      > "$failure_marker"
     return 1
   fi
+  if ! animagine_model_ready; then
+    echo "[entrypoint] Animagine download did not produce a complete model file."
+    printf '%s\n' \
+      "Animagine download completed without the configured model file. Check ANIMAGINE_MODEL_REPO, ANIMAGINE_MODEL_FILE, and ANIMAGINE_MODEL_PATH." \
+      > "$failure_marker"
+    return 1
+  fi
+  rm -f "$failure_marker"
+  echo "[entrypoint] Animagine model download complete: $ANIMAGINE_MODEL_PATH"
 }
 
 download_image_model() {
@@ -194,7 +237,7 @@ prefetch_models() {
 
   if [ "$WAIFU_INPAINT_DOWNLOAD_ON_START" = "1" ]; then
     echo "[entrypoint] Prefetching default editor: $WAIFU_INPAINT_MODEL"
-    hf download "$WAIFU_INPAINT_MODEL"
+    hf_download_with_retry "$WAIFU_INPAINT_MODEL"
     if [ $? -ne 0 ]; then
       echo "[entrypoint] Waifu-Inpaint-XL prefetch failed. Check HF_TOKEN and model access approval."
     fi
@@ -202,7 +245,7 @@ prefetch_models() {
 
   if [ "$IP_ADAPTER_DOWNLOAD_ON_START" = "1" ]; then
     echo "[entrypoint] Prefetching character reference adapter: $IP_ADAPTER_MODEL"
-    hf download "$IP_ADAPTER_MODEL" \
+    hf_download_with_retry "$IP_ADAPTER_MODEL" \
       "${IP_ADAPTER_SUBFOLDER}/${IP_ADAPTER_WEIGHT_NAME}" \
       "${IP_ADAPTER_IMAGE_ENCODER_FOLDER}/config.json" \
       "${IP_ADAPTER_IMAGE_ENCODER_FOLDER}/model.safetensors"
@@ -213,7 +256,7 @@ prefetch_models() {
 
   if [ "$PROMPT_REFINER_DOWNLOAD_ON_START" = "1" ]; then
     echo "[entrypoint] Prefetching prompt refiner: $PROMPT_REFINER_MODEL"
-    hf download "$PROMPT_REFINER_MODEL"
+    hf_download_with_retry "$PROMPT_REFINER_MODEL"
     if [ $? -ne 0 ]; then
       echo "[entrypoint] Prompt refiner prefetch failed."
     fi
