@@ -41,6 +41,7 @@ fi
 : "${ANIME_SEGMENTATION_DOWNLOAD_ON_START:=0}"
 : "${PROMPT_REFINER_DOWNLOAD_ON_START:=1}"
 : "${RUNTIME_SETUP_ON_START:=1}"
+: "${HIDREAM_RUNTIME_SETUP_ON_START:=0}"
 : "${PYTORCH_INDEX_URL:=https://download.pytorch.org/whl/cu128}"
 : "${PYTORCH_VERSION:=2.7.1}"
 : "${TORCHVISION_VERSION:=0.22.1}"
@@ -76,21 +77,7 @@ assert diffusers.__version__ == "0.39.0"
 ' >/dev/null 2>&1
 }
 
-install_runtime_dependencies() {
-  if runtime_dependencies_ready; then
-    echo "[entrypoint] Python and CUDA dependencies are already installed."
-    return 0
-  fi
-
-  echo "[entrypoint] Installing PyTorch CUDA ${PYTORCH_VERSION} and application dependencies."
-  echo "[entrypoint] This runs only on a fresh disk and can take several minutes."
-  pip_install_with_retry --upgrade pip
-  pip_install_with_retry \
-    --index-url "$PYTORCH_INDEX_URL" \
-    "torch==${PYTORCH_VERSION}+cu128" \
-    "torchvision==${TORCHVISION_VERSION}+cu128"
-  pip_install_with_retry -r /workspace/janku-image-studio/requirements-docker.txt
-
+install_hidream_runtime() {
   if [ ! -d /opt/hidream-o1-image/.git ]; then
     echo "[entrypoint] Downloading optional HiDream editor source."
     if ! git clone --depth 1 https://github.com/HiDream-ai/HiDream-O1-Image.git /opt/hidream-o1-image; then
@@ -104,8 +91,29 @@ install_runtime_dependencies() {
     fi
     sed -i 's/"use_flash_attn": True/"use_flash_attn": False/' /opt/hidream-o1-image/models/pipeline.py
   fi
+}
 
-  runtime_dependencies_ready
+install_runtime_dependencies() {
+  if runtime_dependencies_ready; then
+    echo "[entrypoint] Python and CUDA dependencies are already installed."
+  else
+    echo "[entrypoint] Installing PyTorch CUDA ${PYTORCH_VERSION} and application dependencies."
+    echo "[entrypoint] This runs only on a fresh disk and can take several minutes."
+    pip_install_with_retry --upgrade pip
+    pip_install_with_retry \
+      --index-url "$PYTORCH_INDEX_URL" \
+      "torch==${PYTORCH_VERSION}+cu128" \
+      "torchvision==${TORCHVISION_VERSION}+cu128"
+    pip_install_with_retry -r /workspace/janku-image-studio/requirements-docker.txt
+
+    runtime_dependencies_ready
+  fi
+
+  if [ "$HIDREAM_RUNTIME_SETUP_ON_START" = "1" ]; then
+    install_hidream_runtime
+  else
+    echo "[entrypoint] Optional HiDream runtime setup is disabled."
+  fi
 }
 
 file_size_bytes() {

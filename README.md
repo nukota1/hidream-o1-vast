@@ -7,17 +7,16 @@ for development and on a rented GPU server for production.
 
 - Local and Vast.ai text-to-image: Animagine XL 4.0 Zero / SDXL
 - Character reference: h94/IP-Adapter Plus for SDXL
-- Optional localized editing: ShinoharaHare/Waifu-Inpaint-XL with a user mask
-- Optional image editing: FLUX.1-Kontext-dev and HiDream-O1-Image, loaded only when selected
 - Prompt refinement: Qwen/Qwen3.5-9B on GPU, optional per request
 - Character and style training: separate SDXL LoRAs on Animagine XL 4.0 Zero
-- Optional legacy model cache: private Cloudflare R2 for JANKU
 - Generated image storage: private Cloudflare R2
 - Backend and UI: Flask
 - Public gateway: Cloudflare Worker reverse proxy
 - Container registry: GitHub Container Registry
 
-ComfyUI and HiDream O1/I1/E1.1 are not part of the current runtime.
+The standard local and Vast startup does not provision JANKU, Waifu-Inpaint-XL,
+anime segmentation, FLUX.1-Kontext-dev, Qwen-Image-Edit, or HiDream-O1-Image.
+Their legacy/optional code paths remain available for explicit future opt-in.
 
 ## Local development (RTX 5090)
 
@@ -29,13 +28,9 @@ again. Python/CUDA packages persist in `janku-python-local`, so dependency
 installation is also skipped after the first successful setup.
 
 IP-Adapter Plus is loaded into the active SDXL pipeline only when a reference
-image is used. Waifu-Inpaint-XL is retained for explicit user-mask corrections
-and is not part of the default background workflow. The active text model is
-unloaded before an edit model loads, and the editor is unloaded before the next
-SDXL generation. Reserve at least 80GB of Docker disk for the image model,
-prompt refiner, and reference adapter.
-FLUX.1-Kontext-dev and HiDream-O1-Image are intentionally not downloaded until
-they are chosen in the web UI; reserve substantially more disk when using either.
+image is used. Reserve 120GB of disk for the base image, Python/CUDA runtime,
+Animagine checkpoint, prompt refiner, reference adapter, generated files, and
+operational headroom.
 
 1. Start Docker Desktop.
 2. Create `.env` from `.env.example` and set the R2 credentials.
@@ -91,25 +86,21 @@ not disable the required Japanese-to-English tag conversion.
 
 Use `Docker ENTRYPOINT` launch mode and expose port `7861`.
 
-Use at least 100GB for Vast.ai `Disk Space (Container + Volume)` with the
-default editor. Increase this before selecting FLUX.1-Kontext-dev or
-HiDream-O1-Image, because those optional models are downloaded into `/models`.
+Use 120GB for Vast.ai `Disk Space (Container + Volume)` with the current model
+set and use a full Git SHA image tag.
 
 ```text
-ghcr.io/nukota1/hidream-o1-image:latest
+nukota0615/hidream-o1-image:<full-git-commit-sha>
 ```
 
 Copy the variables from `deploy/vast/env.vast.example` into the Vast.ai template.
 Do not put model weights or secrets in Git.
 
-Animagine XL 4.0 Zero is downloaded directly from
-`cagliostrolab/animagine-xl-4.0-zero`. JANKU remains an optional legacy
-configuration and is not the production default.
-
-IP-Adapter Plus and the prompt refiner are prefetched from Hugging Face.
-Waifu-Inpaint-XL is downloaded only when the manual-mask workflow is used.
-FLUX.1-Kontext-dev and HiDream-O1-Image are downloaded only when selected in
-the image-editing model list.
+Only Animagine XL 4.0 Zero, IP-Adapter Plus, its image encoder, and the Qwen
+prompt refiner are prefetched. HiDream source/dependency setup is disabled by
+default as well as all unused model prefetches. Cloudflare API and R2 S3
+credentials are not required in Vast when gallery storage goes through the
+Worker binding.
 
 ## Image editing models
 
@@ -131,13 +122,10 @@ The composition panel offers two workflows:
    area of a user-supplied mask. Automatic silhouette extraction is deliberately
    not used. This is an advanced repair tool, not the background-change path.
 
-FLUX.1-Kontext-dev and HiDream-O1-Image remain optional instruction-editing
-backends in the server code, but they are not the default consistency workflow.
-
-Before the first Waifu or FLUX download, log into Hugging Face, accept each
-model's access conditions, create a read token, and set `HF_TOKEN`. A missing
-approval or token is reported in the app instead of preventing the server from
-starting.
+Waifu-Inpaint-XL, FLUX.1-Kontext-dev, and HiDream-O1-Image remain optional
+backends in the server code, but the current Vast template does not provision
+them. Enabling one later requires an explicit environment/configuration change
+and additional disk planning.
 
 ## Character and Style LoRA training
 

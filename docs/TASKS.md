@@ -153,6 +153,7 @@
   - GHCRへの同タグ公開はローカル認証切れで未実施。Vast.aiでは公開済みDocker Hubタグを使用できる
   - ユーザー方針により、現在のローカルマシンと同等のVast.ai構成を後日選定する。インスタンス作成と課金は未実施
 - 2026-08-03: 構成選定を再開した。ローカルはRTX 5090・約32GB VRAMで、Vast.aiのログイン・残高確認後に候補を比較する
+- 2026-08-03: ユーザーがVast.aiテンプレートとCloudflare環境変数を設定した。次は現在使用中のモデルだけを準備する新しいSHA固定イメージへテンプレートを更新し、ユーザー側で起動確認する
 
 ### T-004 Worker・Vast.ai・R2・D1のend-to-end確認
 
@@ -183,7 +184,15 @@
   - ローカルComposeへ外部volume `janku-python-local` を追加し、`/venv/main`のPython/CUDA依存を再作成後も保持するようにした
   - 任意のHiDream取得失敗が標準アプリを再起動ループへ入れないよう、警告継続へ変更した
   - コンテナを2回再作成し、2回目以降は `Python and CUDA dependencies are already installed.` となり再インストールが省略されることを確認した
+- 2026-08-03:
+  - Vast.aiの標準prefetchをAnimagine XL 4.0 Zero、SDXL IP-Adapter Plus、Qwen3.5-9Bだけに整理した
+  - 未使用のJANKU、Waifu-Inpaint、anime segmentation、FLUX、Qwen-Image-Edit、HiDream用変数を標準環境変数例から除外した
+  - 従来はfresh diskで実行されていたHiDreamソース・追加依存のセットアップを `HIDREAM_RUNTIME_SETUP_ON_START=1` の明示的なopt-inへ変更し、既定を無効にした
+  - Worker経由のR2保存ではVast側のCloudflare APIトークン・R2 S3認証が不要であることをデプロイ手順へ明記した
+  - 自動テスト57件、主要Python 5ファイルとBashの構文、Compose設定、Docker buildが成功した
+  - ローカル秘密情報ファイルと評価用 `output/` がビルド済みイメージへ含まれないことを確認した
 - 残作業:
+  - 新しいSHA固定イメージをVast.aiで起動し、fresh diskの依存セットアップ時間とモデル取得量を実測する
   - Vast.aiの永続ディスクで同等の依存キャッシュを採用するか、イメージサイズと比較する
 
 ### T-016 実用Character LoRAの品質評価

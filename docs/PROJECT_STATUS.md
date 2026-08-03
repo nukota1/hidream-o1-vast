@@ -51,6 +51,8 @@
 - ローカルとVast.aiの既定モデルをAnimagine XL 4.0 Zeroへ統一
 - PRではコンテナbuildのみ、`main`へのpushではGHCR・Docker Hub公開まで行うGitHub Actions構成
 - SHA固定のVast.ai用イメージをDocker Hubへ手動公開できる運用経路
+- Vast.aiの標準起動時取得をAnimagine XL 4.0 Zero、SDXL IP-Adapter Plus、Qwen3.5-9Bに限定する構成
+- 未使用のHiDreamソース・追加依存を明示的なopt-inへ分離
 
 ## 確認結果
 
@@ -110,6 +112,8 @@
 - 2026-08-03に新しいCloudflareアカウントAPIトークンがactiveであり、Worker、R2、D1の既存リソースを読み取れることを確認
 - 新しいR2 S3認証で `hidream-o1-generated-images` と `ai-model-cache` の読み取りに成功
 - 既存WorkerにR2・D1・Access・Backendの各binding、D1にgallery用テーブルが存在することを確認
+- 2026-08-03のVast現行モデル限定化後、自動テスト57件、主要Python 5ファイルとBashの構文、Docker Compose設定、Vast用Docker buildが成功
+- 再ビルドしたVast用イメージにローカル `docs/KEYS.md` と `output/` が含まれず、HiDream runtime既定無効とJANKU環境変数除外が反映されることを確認
 
 ## 既知の制約
 
@@ -133,6 +137,7 @@
 - Vast.aiインスタンスは未契約。ローカルのRTX 5090・約32GB VRAM相当の構成選定を再開し、Vast.aiのログイン・残高確認を待っている
 - Cloudflareの検証用認証は利用可能。本番稼働前にAPIトークンとR2 S3キーをローテーションする
 - 現在デプロイ済みの `BACKEND_SHARED_SECRET` bindingは `plain_text` のため、次回Workerデプロイ時にWorker Secretへ置き換える
+- 現在のZero用Character LoRAはGit・公開Dockerイメージに含まれないため、Vast.aiでは互換LoRAを `/models/loras` へ別途移行または再学習する必要がある
 - Vast.ai側でPython/CUDA依存を永続ディスクへ保存するか、依存込みイメージとの起動時間・転送量を比較する必要がある
 - 旧クロマ・人物抽出コードは既存資産と手動処理の互換用に残っているが、標準UIからは実行しない
 
@@ -143,7 +148,7 @@
 3. 複数seed・複数視点でRose Crimsonの瞳、顔、後頭部中央のお団子、身長比率、衣装・背景追従性を再評価する（T-017）
 4. 同じ画風で別人物・別背景・複数構図を含む50枚以上からStyle LoRAを学習する（T-017）
 5. OpenPose ControlNetとポーズ参照入力を実装し、手指を含むポーズ追従性を高める（T-015）
-6. ローカル同等のVast.ai構成を選定し、公開済みSHA固定イメージを起動してWorker・R2・D1までend-to-endで再検証する
+6. 現在使用中のモデルだけを準備する新しいSHA固定イメージでVast.aiを起動し、Worker・R2・D1までend-to-endで再検証する
 
 ## 開発環境
 

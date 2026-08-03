@@ -219,3 +219,15 @@
   - 画風強度はブラウザへ保存し、生成時メタデータにも記録して履歴参照時に復元する。
 - 理由: 同一Seedでは同じ画像が再生成され、promptや画風までランダム化すると候補間の比較が難しくなる。Seedだけを変えると、画風と構図意図を維持しながら確率的な差分を得られる。直列実行は単一GPUのVRAM競合を避け、既存の生成ロックとも整合する。
 - トレードオフ: 指定枚数に比例して待ち時間が増える。最大8枚に制限し、各画像の完了を進捗と結果一覧へ逐次反映する。
+
+## D-021 Vast.aiの標準環境は現在使用中のモデルだけを準備する
+
+- 状態: 採用
+- 決定:
+  - Vast.aiの起動時prefetchはAnimagine XL 4.0 Zero、SDXL IP-Adapter Plusとimage encoder、Qwen3.5-9Bに限定する。
+  - JANKU、Waifu-Inpaint-XL、anime segmentation、FLUX.1-Kontext-dev、Qwen-Image-Edit、HiDream-O1-Imageは標準テンプレートへ設定しない。
+  - HiDreamのソースと追加Python依存は `HIDREAM_RUNTIME_SETUP_ON_START=1` の場合だけ準備し、既定は無効にする。
+  - Worker経由でギャラリーをR2へ保存する構成では、Cloudflare APIトークンとR2 S3認証をVastへ渡さない。Vast側の `R2_*` はバックエンド直結の手動保存を使う場合だけ設定する。
+  - Character・Style LoRAはユーザー資産として公開イメージへ埋め込まず、互換profileを確認して `/models/loras` へ別途配置する。
+- 理由: 32GB級GPU・120GB diskのVast.aiインスタンスで、使用しない大容量モデル、不要な依存、過剰な秘密情報を取得・保持せず、初回起動時間とディスク消費を抑えるため。
+- トレードオフ: 未設定の任意エディタはそのまま利用できない。後から有効化する場合は、モデルごとに環境変数、アクセス条件、追加ディスク、互換依存を再確認する必要がある。

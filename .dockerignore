@@ -6,4 +6,5 @@ __pycache__/
 .git/
 .env
 .env.*
+docs/KEYS.md
 *.pyc

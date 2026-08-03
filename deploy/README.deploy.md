@@ -3,23 +3,23 @@
 ## Vast.ai template
 
 ```text
-Image: nukota0615/hidream-o1-image:latest
+Image: nukota0615/hidream-o1-image:<full-git-commit-sha>
 Launch mode: Docker ENTRYPOINT
-Container disk: 120GB or more for the default editor
+Container disk: 120GB
 Internal port: 7861 (Vast.ai assigns the external port after startup)
 ```
 
-Set the variables from `vast/env.vast.example`. Required secret values are:
+Use a full SHA tag instead of `latest`, then set the variables from
+`vast/env.vast.example`. The only secret required for the Worker-to-Vast path is:
 
 ```text
-R2_ENDPOINT_URL
-R2_ACCESS_KEY_ID
-R2_SECRET_ACCESS_KEY
+BACKEND_SHARED_SECRET
 ```
 
-The same R2 credentials currently access both `ai-model-cache` and the generated
-image bucket. Separate least-privilege credentials can be introduced before public
-production launch.
+Set the same value as a Cloudflare Worker secret. The Worker stores generated
+images through its R2 binding, so the Vast container does not need a Cloudflare
+API token or R2 S3 credentials. `R2_*` is optional and only enables the backend's
+manual `R2に保存` endpoint.
 
 ## Model lifecycle
 
@@ -31,19 +31,24 @@ visible in the instance logs. It is skipped after the dependencies are
 installed on the disk.
 
 The container does not contain model weights. After the Python setup, it begins
-background prefetch for:
+background prefetch only for the models used by the current workflow:
 
-1. JANKU v7.77 from private R2
-2. Waifu-Inpaint-XL, the default editor, from Hugging Face
-3. Qwen3.5 prompt refiner from Hugging Face
+1. Animagine XL 4.0 Zero from Hugging Face
+2. SDXL IP-Adapter Plus and its image encoder from Hugging Face
+3. Qwen3.5-9B prompt refiner from Hugging Face
 
-FLUX.1-Kontext-dev and HiDream-O1-Image are downloaded only after a user
-selects the corresponding editor in the web UI. Allocate additional disk before
-using them. The Hugging Face account must accept required model conditions and
-the instance must have a read token in `HF_TOKEN`.
+The standard template does not configure JANKU, Waifu-Inpaint-XL, anime
+segmentation, FLUX.1-Kontext-dev, Qwen-Image-Edit, or HiDream-O1-Image.
+HiDream source and its extra Python dependencies are also skipped unless
+`HIDREAM_RUNTIME_SETUP_ON_START=1` is explicitly set. `HF_TOKEN` is optional for
+higher Hugging Face download limits.
 
 Models are stored under `/models`. Mount a persistent volume there when the Vast
 host supports it; otherwise they are downloaded for every new instance.
+
+Character and Style LoRA files are user assets rather than base models. They are
+not embedded in the public image or downloaded by the standard template. Copy or
+train compatible `sdxl-animagine-zero` LoRAs under `LORA_ROOT` separately.
 
 ## Cloudflare Worker and authentication
 

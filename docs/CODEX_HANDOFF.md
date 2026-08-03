@@ -1,6 +1,6 @@
 # Codex Handoff
 
-最終更新: 2026-07-31 (JST)
+最終更新: 2026-08-03 (JST)
 
 この文書は次のチャットの開始地点である。現在の区切りは、Zero用Character LoRAの初回学習・評価に加え、長い人物定義下でのprompt優先制御（T-018）と、1〜8枚の逐次生成・画風設定の保存と履歴復元（T-019）を実装してローカル実機確認まで終えた時点。T-018とT-019は完了した。Character LoRAはcheckpoint 720が正面の瞳と猫型髪飾り、600が背面のお団子に優れるが、単一重みで全条件を満たさないためT-017は未完了。
 
@@ -218,7 +218,11 @@ LoRAはポーズを固定する機能ではない。テキストとIP-Adapterだ
   - `IP_ADAPTER_CHARACTER_CROP=1`
 - Waifu-Inpaintとanime segmentationの起動時prefetchは既定で無効
 - モデルはDockerイメージへ含めず、永続volumeへ保存する
-- 任意HiDream取得が失敗しても、標準生成とZero取得は継続する
+- Vast.aiの標準prefetchはAnimagine XL 4.0 Zero、SDXL IP-Adapter Plus、Qwen3.5-9Bだけ
+- JANKU、Waifu-Inpaint、anime segmentation、FLUX、Qwen-Image-Edit、HiDreamの環境変数は標準テンプレートへ設定しない
+- HiDreamソース・追加依存は `HIDREAM_RUNTIME_SETUP_ON_START=1` の明示的なopt-inでのみセットアップする
+- Worker経由のR2保存ではVast側のCloudflare APIトークンとR2 S3認証は不要
+- Character・Style LoRAは公開イメージへ含まれず、Vastの `/models/loras` へ別途移行または再学習が必要
 
 ローカル操作はREADMEと `scripts/local.ps1` を正本にする。既存コンテナが動いている場合、実行状態を確認してから再作成すること。
 
@@ -312,7 +316,7 @@ git diff --check
 
 Node.jsが実行コンテナにない場合は、Nodeを含む既存ビルド環境で `node --check static/app.js` を実行する。
 
-2026-07-31の最終確認では、自動テスト57件、`app.py`・`prompt_refiner.py`・`sdxl_janku_workflow.py` のPython構文、Docker build、`git diff --check` が成功した。実行環境にNode.jsがないため `node --check static/app.js` は未実施だが、実ブラウザで複数生成・履歴復元まで操作し、コンソールエラー0件を確認した。T-017では画像36・caption 36・欠落0・空caption 0、Zeroの両CLIP tokenizerで77トークン超過0、dry-run、720ステップ学習、LoRA smoke load、5条件の実GPU比較も確認済み。
+2026-07-31の最終確認では、自動テスト57件、`app.py`・`prompt_refiner.py`・`sdxl_janku_workflow.py` のPython構文、Docker build、`git diff --check` が成功した。実行環境にNode.jsがないため `node --check static/app.js` は未実施だが、実ブラウザで複数生成・履歴復元まで操作し、コンソールエラー0件を確認した。T-017では画像36・caption 36・欠落0・空caption 0、Zeroの両CLIP tokenizerで77トークン超過0、dry-run、720ステップ学習、LoRA smoke load、5条件の実GPU比較も確認済み。2026-08-03のVast現行モデル限定化後も自動テスト57件、主要Python 5ファイルとBashの構文、Compose設定、Docker buildが成功し、ビルド済みイメージに `docs/KEYS.md` と `output/` が含まれないことを確認した。
 
 ## 10. 次に行うこと
 
@@ -332,7 +336,7 @@ Character LoRAの評価後に、Style LoRA用50枚以上、T-015のOpenPose、Va
 ## 11. Gitとデプロイ
 
 - ブランチ: `codex/animagine-zero-dual-lora`
-- 引き継ぎ更新前のHEAD: `2d459da60b3c45730e5f2767054f10ef6d833e33`
+- 今回のVast構成整理前のHEAD: `e84a7a6490d7fc74b0e4dd5acc7432ad61f27aad`
 - Zero統一、LoRA互換性保護、Character/Style同時適用はローカル開発環境へ実装済み
 - Vast.ai本番反映、Cloudflare反映は未実施
 - 2026-08-01にローカル評価画像の `output/` をDocker build対象外へ修正し、`c8233dcaba06d4cf180bd31e9bc8006b191faf34` をpushした
@@ -345,6 +349,7 @@ Character LoRAの評価後に、Style LoRA用50枚以上、T-015のOpenPose、Va
 - 既存WorkerのR2・D1・Access・Backend bindingとD1テーブルを確認したが、デプロイは2026-07-22のままである
 - 現在の `BACKEND_SHARED_SECRET` は `plain_text` bindingのため、Vast URL確定後にWorker Secretとして再設定する
 - 検証用のCloudflare APIトークンとR2 S3キーは本番稼働前にローテーションする。値はGit・文書へ保存しない
+- 2026-08-03にVast.aiテンプレートとCloudflare環境変数の設定が完了し、現在使用中の3モデル系統だけを準備する起動構成へソースと環境変数例を変更した。新しいSHA固定イメージのVast実機起動はユーザーが行う
 - `input/` はGit管理外。教師画像36枚はローカルにだけ存在する
 - `output/t017-zero-lora/` はGitへ未追加。比較画像と評価記録は現在ローカルにだけ存在する
 - T-017のcaption・ステージング・比較画像はローカル資産として維持し、T-018とT-019のソース・テスト・管理文書はこのブランチへcommit・pushする

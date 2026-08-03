@@ -54,6 +54,7 @@ ipython_config.py
 .env
 .env.*
 deploy/cloudflare-worker/wrangler.toml
+docs/KEYS.md
 .venv
 env/
 venv/
@@ -102,6 +103,7 @@ huggingface/
 # Generated outputs
 input/
 outputs/
+output/
 results/
 samples/
 generated/
