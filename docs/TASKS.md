@@ -115,6 +115,37 @@
   - 画風強度を73へ変更して再読み込み後も73を維持し、20へ変更後に最新履歴を参照すると73へ戻ることを確認した
   - 履歴適用後の再読み込みでも73を維持し、ブラウザコンソールエラー0件を確認した
 
+### T-020 ユーザー別LoRAのR2永続化
+
+- ステータス: `in_progress`
+- 優先度: 高
+- 背景:
+  - Vast.aiの `/models` はインスタンス交換で失われる可能性があり、学習済みLoRAをサービスの正本にできない
+  - Cloudflare Worker経由では利用者IDが `X-App-User-Id` としてVastへ渡され、既存のローカルLoRAもユーザー別ディレクトリへ分離される
+  - 今後はCharacterだけでなくStyleなど複数カテゴリを利用者ごとに学習・再利用する
+- 実装内容:
+  - R2の `loras/v1/owners/<owner-key>/models/<model-id>` をユーザー別正本にし、生の利用者IDをオブジェクトキーへ含めない
+  - 学習完了後に推論重み、学習設定、メタデータを自動アップロードする
+  - LoRA一覧と生成時に要求された利用者だけを遅延同期し、サイズとSHA-256を検証して `/models/loras` へ復元する
+  - Character、Style、Pose、Backgroundを共通形式で保存し、基盤モデルprofileの互換性判定は既存処理を維持する
+  - 教師画像とcaptionのバックアップは環境変数による明示的なopt-inにする
+  - 既存ローカルLoRAを同一ownerまたは指定したremote owner keyへ移行するCLIを追加する
+- 完了条件:
+  - 別ユーザーのLoRAが一覧・同期・生成対象へ混ざらない
+  - CharacterとStyleの両方を新しいローカルストアへ復元できる
+  - 破損した重みをチェックサム検証で拒否する
+  - 学習成功とR2保存失敗を分離し、保存失敗時もローカルの完成重みを使用できる
+  - 自動テスト、Python構文、Docker build、秘密情報を含まない設定例を確認する
+  - GitHubと新しいSHA固定Dockerイメージへ反映し、Vast.aiでユーザー別R2同期をend-to-end確認する
+- 2026-08-03 ローカル実装・確認:
+  - ユーザー別R2同期、学習後アップロード、遅延復元、チェックサム検証、任意の教師画像保存、移行CLIを実装した
+  - R2を模擬したCharacter・Style復元、ユーザー分離、ローカルからcloud ownerへの移行、教師画像opt-in、破損拒否を含む自動テスト63件が成功した
+  - 変更Pythonファイルの構文、Compose設定、Docker buildが成功した
+  - ビルド済みイメージにR2同期コードが入り、`docs/KEYS.md` と `output/` が含まれないことを確認した
+- 残作業:
+  - 変更をcommit・GitHubへpushし、新しいSHA固定Dockerイメージを公開する
+  - Cloudflare Access経由のowner keyへ現在のZero Character LoRAを移行し、Vast.aiで復元・生成を確認する
+
 ### T-015 OpenPose ControlNetによる厳密なポーズ制御
 
 - ステータス: `todo`
@@ -157,7 +188,8 @@
 - 2026-08-03 現行モデル限定イメージ公開:
   - `nukota0615/hidream-o1-image:4b7d43c33ce7452cd4a7cb9e6da90011d9d6840f` をDocker Hubへ公開した
   - リモートdigest `sha256:14ef1788ac1b8dcc632906e065cd60274248e0114a8a918be8319865ca053df5`、実行platform `linux/amd64` を確認した
-  - 残作業はユーザーによるVast.aiテンプレートのタグ更新と実インスタンス起動確認
+  - 最初のVastホストではregistry layer展開に失敗したが、別ホストへ変更後は起動と通常イラスト生成に成功した
+  - 残作業は参照画像あり生成と、T-020のLoRA復元を含む最新イメージの確認
 
 ### T-004 Worker・Vast.ai・R2・D1のend-to-end確認
 

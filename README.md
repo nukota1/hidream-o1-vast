@@ -98,9 +98,11 @@ Do not put model weights or secrets in Git.
 
 Only Animagine XL 4.0 Zero, IP-Adapter Plus, its image encoder, and the Qwen
 prompt refiner are prefetched. HiDream source/dependency setup is disabled by
-default as well as all unused model prefetches. Cloudflare API and R2 S3
-credentials are not required in Vast when gallery storage goes through the
-Worker binding.
+default as well as all unused model prefetches. Gallery storage through the
+Worker binding does not require Cloudflare credentials in Vast. Enabling
+per-user LoRA persistence does require bucket-scoped `LORA_R2_*` S3 credentials;
+the exact variables and migration command are documented in
+`deploy/README.deploy.md`.
 
 ## Image editing models
 

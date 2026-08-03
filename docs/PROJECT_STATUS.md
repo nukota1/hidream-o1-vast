@@ -53,6 +53,9 @@
 - SHA固定のVast.ai用イメージをDocker Hubへ手動公開できる運用経路
 - Vast.aiの標準起動時取得をAnimagine XL 4.0 Zero、SDXL IP-Adapter Plus、Qwen3.5-9Bに限定する構成
 - 未使用のHiDreamソース・追加依存を明示的なopt-inへ分離
+- Cloudflare Access利用者ごとにハッシュ化したR2プレフィックスへCharacter・StyleなどのLoRAを保存する永続化層
+- 学習完了後のLoRA自動アップロード、利用者別の遅延復元、サイズ・SHA-256検証、atomic配置
+- 教師画像・captionの任意バックアップと、既存ローカルLoRAのR2移行CLI
 
 ## 確認結果
 
@@ -116,6 +119,10 @@
 - 再ビルドしたVast用イメージにローカル `docs/KEYS.md` と `output/` が含まれず、HiDream runtime既定無効とJANKU環境変数除外が反映されることを確認
 - 現行モデル限定コミット `4b7d43c33ce7452cd4a7cb9e6da90011d9d6840f` のVast.ai用イメージをDocker Hubへ公開
 - 公開タグ `nukota0615/hidream-o1-image:4b7d43c33ce7452cd4a7cb9e6da90011d9d6840f`、digest `sha256:14ef1788ac1b8dcc632906e065cd60274248e0114a8a918be8319865ca053df5`、実行platform `linux/amd64` をリモート確認
+- Vast.aiの最初のホストではコンテナlayer展開が失敗したが、別ホストへ変更後はアプリ起動と通常イラスト生成に成功
+- ユーザー別LoRA R2同期の模擬テストを追加し、Character・Style復元、ユーザー分離、ローカルからcloud ownerへの移行、教師画像opt-in、破損重み拒否を含む自動テスト63件が成功
+- R2同期を含む変更Pythonファイルの構文、Compose設定、Docker buildが成功
+- ビルド済みイメージにR2同期コードが入り、`docs/KEYS.md` と `output/` が含まれないことを確認
 
 ## 既知の制約
 
@@ -135,22 +142,23 @@
 - 600・800ステップ版は400ステップ版より脚が長くなり、猫型髪飾りがお団子側へ寄る傾向があるため既定採用しない
 - テキストだけではガラスの林檎のピアスなど小さな装飾を毎回視認可能な形で保証できない。最終promptへは保持するが、再現率はLoRA・学習データ・解像度にも依存する
 - LoRA＋参照25%は外見維持が強い一方、元ポーズや靴の要素を少し引き継ぐ。ポーズ優先時は参照20%を推奨
-- 最新コードのVast.ai起動とCloudflare Worker・R2・D1を含むend-to-end検証は未実施
-- Vast.aiインスタンスは未契約。ローカルのRTX 5090・約32GB VRAM相当の構成選定を再開し、Vast.aiのログイン・残高確認を待っている
+- Vast.aiでは現行公開イメージの起動と通常生成に成功したが、参照生成およびCloudflare Worker・R2・D1を含むend-to-end検証は未実施
 - Cloudflareの検証用認証は利用可能。本番稼働前にAPIトークンとR2 S3キーをローテーションする
 - 現在デプロイ済みの `BACKEND_SHARED_SECRET` bindingは `plain_text` のため、次回Workerデプロイ時にWorker Secretへ置き換える
-- 現在のZero用Character LoRAはGit・公開Dockerイメージに含まれないため、Vast.aiでは互換LoRAを `/models/loras` へ別途移行または再学習する必要がある
+- 現在のZero用Character LoRAはGit・公開Dockerイメージに含まれない。R2移行コードはローカル実装済みだが、Cloudflare Access利用者のowner keyへの実データ移行は未実施
+- ユーザー別LoRA R2同期はローカル模擬テスト済みだが、実R2・Vast.aiを使うend-to-end確認、LoRA削除、保存期間管理、複数Vast間の同時学習排他は未実施
 - Vast.ai側でPython/CUDA依存を永続ディスクへ保存するか、依存込みイメージとの起動時間・転送量を比較する必要がある
 - 旧クロマ・人物抽出コードは既存資産と手動処理の互換用に残っているが、標準UIからは実行しない
 
 ## 次の優先作業
 
-1. 正面では後頭部のお団子を常時挿入しない視点依存の人物固定定義を検討する（T-017）
-2. 体格・お団子教師画像の比率、caption、repeat数を見直してZero用Character LoRAを再学習する（T-017）
-3. 複数seed・複数視点でRose Crimsonの瞳、顔、後頭部中央のお団子、身長比率、衣装・背景追従性を再評価する（T-017）
-4. 同じ画風で別人物・別背景・複数構図を含む50枚以上からStyle LoRAを学習する（T-017）
-5. OpenPose ControlNetとポーズ参照入力を実装し、手指を含むポーズ追従性を高める（T-015）
-6. 現在使用中のモデルだけを準備する新しいSHA固定イメージでVast.aiを起動し、Worker・R2・D1までend-to-endで再検証する
+1. ユーザー別LoRA R2同期をGitHubと新しいSHA固定イメージへ反映する（T-020）
+2. Cloudflare Access利用者のowner keyへ現在のZero LoRAを移行し、Vast.aiで復元・生成を確認する（T-020）
+3. 正面では後頭部のお団子を常時挿入しない視点依存の人物固定定義を検討する（T-017）
+4. 体格・お団子教師画像の比率、caption、repeat数を見直してZero用Character LoRAを再学習する（T-017）
+5. 複数seed・複数視点でRose Crimsonの瞳、顔、後頭部中央のお団子、身長比率、衣装・背景追従性を再評価する（T-017）
+6. 同じ画風で別人物・別背景・複数構図を含む50枚以上からStyle LoRAを学習する（T-017）
+7. OpenPose ControlNetとポーズ参照入力を実装し、手指を含むポーズ追従性を高める（T-015）
 
 ## 開発環境
 

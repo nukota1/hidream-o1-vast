@@ -38,6 +38,7 @@ from lora_training import (
     is_lora_compatible,
     model_type_label,
 )
+from lora_r2_sync import LoraR2Sync
 from prompt_refiner import LocalPromptRefiner
 from sdxl_janku_workflow import (
     configure_pipeline_loras,
@@ -85,6 +86,7 @@ IMAGE_MODEL_LABEL = os.environ.get(
 )
 APP_NAME = os.environ.get("APP_NAME", "Animagine Image Studio" if IMAGE_MODEL_FAMILY == "animagine" else "JANKU Image Studio")
 LORA_STORE = LoraStore()
+LORA_R2_SYNC = LoraR2Sync.from_environment(LORA_STORE)
 
 BASE_NEGATIVE_PROMPT = (
     "lowres, worst quality, low quality, bad anatomy, bad hands, extra fingers, "
@@ -1847,6 +1849,19 @@ def public_lora(metadata):
     return item
 
 
+def sync_loras_for_owner(owner_id, *, force=False):
+    try:
+        return LORA_R2_SYNC.sync_owner(owner_id, force=force)
+    except Exception as exc:
+        traceback.print_exc()
+        return {
+            "status": "error",
+            "remote_models": 0,
+            "downloaded": 0,
+            "message": str(exc)[:500],
+        }
+
+
 def configure_requested_loras(pipe, requested):
     signature = tuple(
         (
@@ -1879,6 +1894,7 @@ def configure_requested_loras(pipe, requested):
 def read_requested_lora(owner_id, model_id, category):
     if not model_id:
         return None
+    sync_loras_for_owner(owner_id)
     try:
         metadata = LORA_STORE.read(owner_id, model_id)
     except KeyError as exc:
@@ -1960,6 +1976,10 @@ def api_prompt_catalog():
 @app.route("/api/lora/models")
 def api_lora_models():
     owner_id = request_owner_id()
+    sync_result = sync_loras_for_owner(
+        owner_id,
+        force=str(request.args.get("refresh") or "").lower() in {"1", "true", "yes"},
+    )
     return jsonify({
         "items": [public_lora(item) for item in LORA_STORE.list(owner_id)],
         "current_model_type": current_model_type(),
@@ -1967,6 +1987,7 @@ def api_lora_models():
         "cuda_available": torch.cuda.is_available(),
         "recommended_image_counts": RECOMMENDED_IMAGE_COUNTS,
         "max_image_counts": MAX_LORA_IMAGES_BY_CATEGORY,
+        "remote_storage": LORA_R2_SYNC.public_status(owner_id, sync_result),
     })
 
 
@@ -2055,7 +2076,33 @@ def api_lora_train_start():
                 completed_at=datetime.now(timezone.utc).isoformat(),
                 error="",
             )
-            q.put({"type": "done", "model": public_lora(completed)})
+            sync_result = {"status": "disabled", "uploaded": 0}
+            if LORA_R2_SYNC.enabled and LORA_R2_SYNC.upload_after_training:
+                q.put({
+                    "type": "status",
+                    "phase": "storage",
+                    "message": "学習済みLoRAをユーザー専用ストレージへ保存しています",
+                })
+                try:
+                    sync_result = LORA_R2_SYNC.publish_model(owner_id, model_id)
+                    completed = LORA_STORE.read(owner_id, model_id)
+                except Exception as sync_exc:
+                    traceback.print_exc()
+                    completed = LORA_R2_SYNC.mark_publish_failed(
+                        owner_id,
+                        model_id,
+                        sync_exc,
+                    )
+                    sync_result = {
+                        "status": "error",
+                        "uploaded": 0,
+                        "message": str(sync_exc)[:500],
+                    }
+            q.put({
+                "type": "done",
+                "model": public_lora(completed),
+                "remote_storage": sync_result,
+            })
         except Exception as exc:
             traceback.print_exc()
             failed = LORA_STORE.update(

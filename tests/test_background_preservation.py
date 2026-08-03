@@ -42,6 +42,26 @@ from image_edit_workflows import (
 
 
 class BackgroundPreservationTests(unittest.TestCase):
+    def test_lora_models_syncs_only_the_authenticated_owner(self):
+        sync_result = {
+            "status": "synced",
+            "remote_models": 0,
+            "downloaded": 0,
+        }
+        with (
+            patch.object(app_module.LORA_R2_SYNC, "sync_owner", return_value=sync_result) as sync,
+            patch.object(app_module.LORA_R2_SYNC, "public_status", return_value=sync_result),
+            patch.object(app_module.LORA_STORE, "list", return_value=[]),
+        ):
+            response = app_module.app.test_client().get(
+                "/api/lora/models?refresh=1",
+                headers={"X-App-User-Id": "cloudflare-user-a"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        sync.assert_called_once_with("cloudflare-user-a", force=True)
+        self.assertEqual(response.get_json()["remote_storage"]["status"], "synced")
+
     def test_batch_generation_seeds_keep_first_and_randomize_followups(self):
         values = iter((32, 101, 202))
 

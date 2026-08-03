@@ -227,7 +227,21 @@
   - Vast.aiの起動時prefetchはAnimagine XL 4.0 Zero、SDXL IP-Adapter Plusとimage encoder、Qwen3.5-9Bに限定する。
   - JANKU、Waifu-Inpaint-XL、anime segmentation、FLUX.1-Kontext-dev、Qwen-Image-Edit、HiDream-O1-Imageは標準テンプレートへ設定しない。
   - HiDreamのソースと追加Python依存は `HIDREAM_RUNTIME_SETUP_ON_START=1` の場合だけ準備し、既定は無効にする。
-  - Worker経由でギャラリーをR2へ保存する構成では、Cloudflare APIトークンとR2 S3認証をVastへ渡さない。Vast側の `R2_*` はバックエンド直結の手動保存を使う場合だけ設定する。
-  - Character・Style LoRAはユーザー資産として公開イメージへ埋め込まず、互換profileを確認して `/models/loras` へ別途配置する。
+  - Worker経由でギャラリーをR2へ保存する構成では、Cloudflare APIトークンと汎用 `R2_*` 認証をVastへ渡さない。LoRA永続化だけはD-022の専用 `LORA_R2_*` 認証を使用する。
+  - Character・Style LoRAはユーザー資産として公開イメージへ埋め込まず、`/models/loras` をローカルキャッシュとして扱う。
 - 理由: 32GB級GPU・120GB diskのVast.aiインスタンスで、使用しない大容量モデル、不要な依存、過剰な秘密情報を取得・保持せず、初回起動時間とディスク消費を抑えるため。
 - トレードオフ: 未設定の任意エディタはそのまま利用できない。後から有効化する場合は、モデルごとに環境変数、アクセス条件、追加ディスク、互換依存を再確認する必要がある。
+
+## D-022 ユーザー別LoRAはR2を正本、Vast.aiを検証済みキャッシュにする
+
+- 状態: 採用
+- 決定:
+  - 学習済みLoRAのメタデータ、推論重み、学習設定はCloudflare R2を正本とし、Vast.aiの `LORA_ROOT` は交換可能なローカルキャッシュとする。
+  - Cloudflare Accessの利用者IDはR2キーへ直接含めず、既存の `owner_storage_key()` と同じSHA-256由来のowner keyへ変換する。
+  - Character、Style、および将来のPose・Background LoRAは同じ保存形式を使い、カテゴリと基盤モデルprofileをメタデータで判定する。
+  - 学習完了後は成果物を先にアップロードし、全ファイルのサイズとSHA-256を持つ `metadata.json` を最後に置いて公開完了マーカーとする。
+  - LoRA一覧または生成要求時に、その利用者のR2プレフィックスだけを遅延同期する。復元時はサイズとSHA-256が一致したファイルだけをatomic renameし、破損した重みは登録しない。
+  - 教師画像とcaptionは既定ではR2へ保存せず、保存期間、削除、プライバシー方針を定めたサービスだけが `LORA_R2_INCLUDE_TRAINING_DATA=1` で明示的に有効化する。
+  - ギャラリーのR2 bindingとは権限を分離し、Vast.aiには `ai-model-cache` へ限定したObject Read & WriteのS3認証を `LORA_R2_*` として設定する。
+- 理由: Vast.aiのインスタンスやディスクを交換してもユーザーの学習成果を失わず、複数ユーザーのCharacter・Style資産を相互に露出させずに同じアプリで扱うため。Dockerイメージへユーザー資産を入れないことで、公開イメージと私有データの境界も維持できる。
+- トレードオフ: 一覧の初回表示ではR2 listingと必要な重みのダウンロード待ちが発生する。複数Vast.aiインスタンスから同一モデルを同時学習する排他制御、削除API、保存期間管理は別途必要になる。

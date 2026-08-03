@@ -1,5 +1,6 @@
 import base64
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
+from lora_r2_sync import LoraR2Sync
 from lora_training import (
     LoraStore,
     current_model_type,
@@ -35,12 +37,65 @@ def encoded_image(colour=(210, 40, 90, 255), size=(512, 512)):
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
+class FakeR2Body(io.BytesIO):
+    pass
+
+
+class FakeR2Client:
+    def __init__(self):
+        self.objects = {}
+
+    def upload_file(self, filename, bucket, key, ExtraArgs=None):
+        self.objects[(bucket, key)] = Path(filename).read_bytes()
+
+    def put_object(self, *, Bucket, Key, Body, **kwargs):
+        self.objects[(Bucket, Key)] = bytes(Body)
+
+    def get_object(self, *, Bucket, Key):
+        return {"Body": FakeR2Body(self.objects[(Bucket, Key)])}
+
+    def download_file(self, bucket, key, filename):
+        Path(filename).write_bytes(self.objects[(bucket, key)])
+
+    def list_objects_v2(self, *, Bucket, Prefix, ContinuationToken=None):
+        contents = [
+            {"Key": key, "Size": len(value)}
+            for (bucket, key), value in sorted(self.objects.items())
+            if bucket == Bucket and key.startswith(Prefix)
+        ]
+        return {"Contents": contents, "IsTruncated": False}
+
+
 class LoraTrainingTests(unittest.TestCase):
     zero_environment = {
         "IMAGE_MODEL_FAMILY": "animagine",
         "IMAGE_MODEL_PROFILE": "sdxl-animagine-zero",
         "ANIMAGINE_MODEL_REPO": "cagliostrolab/animagine-xl-4.0-zero",
     }
+
+    def create_ready_model(self, store, owner_id, category="character"):
+        with patch.dict(os.environ, self.zero_environment):
+            model = store.create(owner_id, {
+                "name": f"{category.title()} asset",
+                "trigger_word": f"nkt_{category}001",
+                "identity_prompt": "petite, blonde hair" if category == "character" else "",
+                "category": category,
+                "model_type": "sdxl-animagine-zero",
+                "images": [{
+                    "image": encoded_image(),
+                    "caption": f"sample {category} caption",
+                }],
+            })
+        output = store.output_path(owner_id, model["id"])
+        output.mkdir(parents=True)
+        (output / "pytorch_lora_weights.safetensors").write_bytes(
+            f"{category}-weights".encode("utf-8")
+        )
+        (output / "training.json").write_text(
+            json.dumps({"category": category}),
+            encoding="utf-8",
+        )
+        return store.update(owner_id, model["id"], status="ready", progress=100)
 
     def test_owner_storage_key_does_not_expose_external_user_id(self):
         self.assertEqual(owner_storage_key("local"), "local")
@@ -164,6 +219,171 @@ class LoraTrainingTests(unittest.TestCase):
                 caption,
                 "pink hair, short hair, school uniform",
             )
+
+    def test_r2_publish_uses_pseudonymous_owner_and_omits_dataset_by_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = LoraStore(directory)
+            model = self.create_ready_model(store, "google-user-123")
+            client = FakeR2Client()
+            sync = LoraR2Sync(
+                store,
+                enabled=True,
+                bucket="model-cache",
+                client=client,
+            )
+
+            result = sync.publish_model("google-user-123", model["id"])
+
+            keys = [key for bucket, key in client.objects if bucket == "model-cache"]
+            self.assertEqual(result["status"], "uploaded")
+            self.assertTrue(all("google-user-123" not in key for key in keys))
+            self.assertTrue(any(key.endswith("/metadata.json") for key in keys))
+            self.assertTrue(any(key.endswith("/pytorch_lora_weights.safetensors") for key in keys))
+            self.assertTrue(any(key.endswith("/training.json") for key in keys))
+            self.assertFalse(any("/dataset/" in key for key in keys))
+            metadata_key = next(key for key in keys if key.endswith("/metadata.json"))
+            remote_metadata = json.loads(client.objects[("model-cache", metadata_key)])
+            self.assertNotIn("captions", remote_metadata)
+            self.assertNotIn("remote_storage", store.public(store.read("google-user-123", model["id"])))
+
+    def test_r2_sync_restores_character_and_style_for_only_the_requested_owner(self):
+        client = FakeR2Client()
+        with tempfile.TemporaryDirectory() as source_directory:
+            source = LoraStore(source_directory)
+            character = self.create_ready_model(source, "owner-a", "character")
+            style = self.create_ready_model(source, "owner-a", "style")
+            publisher = LoraR2Sync(
+                source,
+                enabled=True,
+                bucket="model-cache",
+                client=client,
+            )
+            publisher.publish_model("owner-a", character["id"])
+            publisher.publish_model("owner-a", style["id"])
+
+        with tempfile.TemporaryDirectory() as target_directory:
+            target = LoraStore(target_directory)
+            restorer = LoraR2Sync(
+                target,
+                enabled=True,
+                bucket="model-cache",
+                sync_interval_seconds=0,
+                client=client,
+            )
+
+            result = restorer.sync_owner("owner-a", force=True)
+
+            self.assertEqual(result["status"], "synced")
+            self.assertEqual(result["downloaded"], 2)
+            self.assertEqual(
+                {item["category"] for item in target.list("owner-a")},
+                {"character", "style"},
+            )
+            self.assertEqual(target.list("owner-b"), [])
+            for item in target.list("owner-a"):
+                self.assertTrue(target.weight_path("owner-a", item["id"]).is_file())
+                self.assertFalse(target.model_root("owner-a", item["id"]).joinpath("dataset").exists())
+
+    def test_r2_publish_can_migrate_local_model_to_cloud_owner_key(self):
+        client = FakeR2Client()
+        cloud_owner = "cloudflare-user-a"
+        cloud_owner_key = owner_storage_key(cloud_owner)
+        with tempfile.TemporaryDirectory() as source_directory:
+            source = LoraStore(source_directory)
+            model = self.create_ready_model(source, "local")
+            publisher = LoraR2Sync(
+                source,
+                enabled=True,
+                bucket="model-cache",
+                client=client,
+            )
+            publisher.publish_model(
+                "local",
+                model["id"],
+                remote_owner_key=cloud_owner_key,
+            )
+            self.assertTrue(all(f"/owners/{cloud_owner_key}/" in key for _, key in client.objects))
+
+        with tempfile.TemporaryDirectory() as target_directory:
+            target = LoraStore(target_directory)
+            restorer = LoraR2Sync(
+                target,
+                enabled=True,
+                bucket="model-cache",
+                client=client,
+            )
+            result = restorer.sync_owner(cloud_owner, force=True)
+            self.assertEqual(result["downloaded"], 1)
+            self.assertEqual(target.list(cloud_owner)[0]["id"], model["id"])
+
+    def test_r2_can_include_and_restore_private_training_data(self):
+        client = FakeR2Client()
+        with tempfile.TemporaryDirectory() as source_directory:
+            source = LoraStore(source_directory)
+            model = self.create_ready_model(source, "owner-a")
+            publisher = LoraR2Sync(
+                source,
+                enabled=True,
+                bucket="model-cache",
+                include_training_data=True,
+                client=client,
+            )
+            publisher.publish_model("owner-a", model["id"])
+            self.assertTrue(any("/dataset/001.png" in key for _, key in client.objects))
+            metadata_key = next(key for _, key in client.objects if key.endswith("/metadata.json"))
+            remote_metadata = json.loads(client.objects[("model-cache", metadata_key)])
+            self.assertIn("captions", remote_metadata)
+
+        with tempfile.TemporaryDirectory() as target_directory:
+            target = LoraStore(target_directory)
+            restorer = LoraR2Sync(
+                target,
+                enabled=True,
+                bucket="model-cache",
+                restore_training_data=True,
+                client=client,
+            )
+            restorer.sync_owner("owner-a", force=True)
+            self.assertTrue(
+                target.model_root("owner-a", model["id"]).joinpath("dataset", "001.png").is_file()
+            )
+            self.assertTrue(
+                target.model_root("owner-a", model["id"]).joinpath("dataset", "001.txt").is_file()
+            )
+
+    def test_r2_sync_rejects_corrupted_weight_without_registering_model(self):
+        client = FakeR2Client()
+        with tempfile.TemporaryDirectory() as source_directory:
+            source = LoraStore(source_directory)
+            model = self.create_ready_model(source, "owner-a")
+            publisher = LoraR2Sync(
+                source,
+                enabled=True,
+                bucket="model-cache",
+                client=client,
+            )
+            publisher.publish_model("owner-a", model["id"])
+        weight_key = next(
+            key
+            for bucket, key in client.objects
+            if bucket == "model-cache" and key.endswith("pytorch_lora_weights.safetensors")
+        )
+        client.objects[("model-cache", weight_key)] = b"corrupted"
+
+        with tempfile.TemporaryDirectory() as target_directory:
+            target = LoraStore(target_directory)
+            restorer = LoraR2Sync(
+                target,
+                enabled=True,
+                bucket="model-cache",
+                client=client,
+            )
+            result = restorer.sync_owner("owner-a", force=True)
+
+            self.assertEqual(result["status"], "partial")
+            self.assertEqual(result["downloaded"], 0)
+            self.assertEqual(len(result["errors"]), 1)
+            self.assertEqual(target.list("owner-a"), [])
 
     def test_training_records_use_manifest_and_prefix_trigger(self):
         with tempfile.TemporaryDirectory() as directory:

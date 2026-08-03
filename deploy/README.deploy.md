@@ -10,16 +10,17 @@ Internal port: 7861 (Vast.ai assigns the external port after startup)
 ```
 
 Use a full SHA tag instead of `latest`, then set the variables from
-`vast/env.vast.example`. The only secret required for the Worker-to-Vast path is:
+`vast/env.vast.example`. The Worker-to-Vast proxy itself uses:
 
 ```text
 BACKEND_SHARED_SECRET
 ```
 
 Set the same value as a Cloudflare Worker secret. The Worker stores generated
-images through its R2 binding, so the Vast container does not need a Cloudflare
-API token or R2 S3 credentials. `R2_*` is optional and only enables the backend's
-manual `R2に保存` endpoint.
+gallery images through its own R2 binding, so that path does not need R2 S3
+credentials in Vast. Per-user LoRA persistence is different: the Vast backend
+uploads and restores large LoRA artifacts directly and therefore needs the
+bucket-scoped `LORA_R2_*` S3 credentials from `vast/env.vast.example`.
 
 ## Model lifecycle
 
@@ -47,8 +48,26 @@ Models are stored under `/models`. Mount a persistent volume there when the Vast
 host supports it; otherwise they are downloaded for every new instance.
 
 Character and Style LoRA files are user assets rather than base models. They are
-not embedded in the public image or downloaded by the standard template. Copy or
-train compatible `sdxl-animagine-zero` LoRAs under `LORA_ROOT` separately.
+not embedded in the public image. With `LORA_R2_SYNC_ENABLED=1`, the backend
+stores ready LoRAs under the authenticated user's pseudonymous R2 prefix after
+training and lazily restores only that user's assets when the LoRA list or a
+generation request needs them. `/models/loras` remains a local cache.
+
+The default remote objects are `metadata.json`, the inference weights, and the
+small training configuration. Raw source images and captions remain local unless
+`LORA_R2_INCLUDE_TRAINING_DATA=1` is explicitly selected. Use the matching
+restore flag only when retraining data must be recovered on a new instance.
+
+To publish an existing local compatible LoRA after local verification:
+
+```powershell
+python scripts/sync_lora_r2.py publish --owner-id local --model-id <model-id>
+```
+
+For a one-time migration from the local development owner to a signed-in cloud
+user, read that user's `remote_storage.owner_key` from `GET /api/lora/models`,
+then add `--remote-owner-key <owner-key>`. The command never places the raw
+Cloudflare user ID in an R2 object key.
 
 ## Cloudflare Worker and authentication
 

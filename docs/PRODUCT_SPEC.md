@@ -120,6 +120,10 @@ Style LoRAはCharacter LoRAから分離する。単一人物だけで学習せ�
 
 学習は生成と同じGPUロック内で直列化し、進捗をSSEで返す。状態は `queued`、`training`、`ready`、`failed` として保存し、完成した互換LoRAをカテゴリ別に選択できるようにする。Character LoRAとStyle LoRAは同時にロードし、強度を独立設定する。
 
+学習済みLoRAはCloudflare Accessで認証された利用者ごとに分離する。R2の正本には生のユーザーIDを含めず、バックエンドと同じハッシュ化owner keyを使用する。学習完了後にメタデータ、推論重み、学習設定を保存し、Vast.aiの `/models/loras` はチェックサム検証済みのローカルキャッシュとして扱う。新しいVast.aiインスタンスでは、LoRA一覧または生成時に要求された利用者の資産だけを遅延復元する。
+
+Character、Style、将来のPose・Backgroundカテゴリは同じユーザー分離ストレージ形式を使用する。教師画像とcaptionのR2保存は任意とし、サービスの保存期間・削除・プライバシーポリシーを定めた場合だけ有効化する。
+
 ## 8. 手動局所修正
 
 Waifu-Inpaint-XLは、目、口、手、装飾など、ユーザーが明示した局所だけを修正する上級機能として残す。
@@ -148,7 +152,7 @@ Waifu-Inpaint-XLは、目、口、手、装飾など、ユーザーが明示し�
 
 - 複数GPUへの分散学習
 - 学習ジョブの外部キュー
-- LoRA重みのR2バックアップと複数Vast.aiインスタンス間同期
+- 複数Vast.aiインスタンスによる同一LoRA学習ジョブの同時実行制御
 - 複数参照画像の同時入力
 - FaceID、Depth ControlNet
 - ネイティブな透過レイヤー生成

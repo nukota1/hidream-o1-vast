@@ -209,6 +209,9 @@ class LoraStore:
             raise KeyError("Unknown LoRA")
         return self._owner_root(owner_id) / model_id
 
+    def model_root(self, owner_id, model_id):
+        return self._model_root(owner_id, model_id)
+
     def create(self, owner_id, request_data):
         validated = validate_training_request(request_data)
         model_id = uuid.uuid4().hex
@@ -286,6 +289,15 @@ class LoraStore:
         )
         return metadata
 
+    def write_metadata(self, owner_id, model_id, metadata):
+        if str(metadata.get("id") or "") != model_id:
+            raise ValueError("LoRA metadata ID does not match its storage path.")
+        _atomic_json_write(
+            self._model_root(owner_id, model_id) / "metadata.json",
+            metadata,
+        )
+        return metadata
+
     def list(self, owner_id):
         owner_root = self._owner_root(owner_id)
         if not owner_root.is_dir():
@@ -315,7 +327,7 @@ class LoraStore:
         return {
             key: value
             for key, value in metadata.items()
-            if key not in {"captions"}
+            if key not in {"captions", "remote_storage"}
         }
 
     def training_command(self, owner_id, model_id):

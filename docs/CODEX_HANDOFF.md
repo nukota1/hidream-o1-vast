@@ -221,14 +221,16 @@ LoRAはポーズを固定する機能ではない。テキストとIP-Adapterだ
 - Vast.aiの標準prefetchはAnimagine XL 4.0 Zero、SDXL IP-Adapter Plus、Qwen3.5-9Bだけ
 - JANKU、Waifu-Inpaint、anime segmentation、FLUX、Qwen-Image-Edit、HiDreamの環境変数は標準テンプレートへ設定しない
 - HiDreamソース・追加依存は `HIDREAM_RUNTIME_SETUP_ON_START=1` の明示的なopt-inでのみセットアップする
-- Worker経由のR2保存ではVast側のCloudflare APIトークンとR2 S3認証は不要
-- Character・Style LoRAは公開イメージへ含まれず、Vastの `/models/loras` へ別途移行または再学習が必要
+- Worker経由のギャラリーR2保存ではVast側のCloudflare APIトークンと汎用R2 S3認証は不要
+- ユーザー別LoRA永続化では `LORA_R2_*` のbucket-scoped S3認証をVastへ設定し、`ai-model-cache/loras/v1/owners/<owner-key>/models/<model-id>` を正本にする
+- Character、Style、将来のPose・Backgroundは同じR2形式で分離し、Vastの `/models/loras` は遅延復元するローカルキャッシュとして扱う
+- 学習完了後は推論重みと学習設定を自動保存する。教師画像・captionは `LORA_R2_INCLUDE_TRAINING_DATA=1` の場合だけ保存する
 
 ローカル操作はREADMEと `scripts/local.ps1` を正本にする。既存コンテナが動いている場合、実行状態を確認してから再作成すること。
 
 ## 8. 2026-07-28〜31の確認結果
 
-- 既存フロー、Zero・複数LoRA、prompt優先制御、逐次複数生成、画風履歴を含む自動テスト57件成功
+- 既存フロー、Zero・複数LoRA、prompt優先制御、逐次複数生成、画風履歴、ユーザー別R2同期を含む自動テスト63件成功
 - Python、JavaScript、Bashの構文確認成功
 - Docker Compose設定確認とDockerイメージビルド成功
 - ローカルUIでZero表示、Character・Styleの別セレクタ、Style学習時の人物固定項目非表示を確認
@@ -287,6 +289,11 @@ LoRAはポーズを固定する機能ではない。テキストとIP-Adapterだ
 - 実Web UIで2枚をSeed `32` とランダムな別Seedで直列生成し、Seed付き2列結果と選択画像の切替を確認
 - 画風強度を73へ変更して再読み込み後も73を維持し、20へ変更後に最新履歴を参照すると73へ戻ることを確認
 - 履歴適用後の再読み込みでも73を維持し、ブラウザコンソールエラー0件
+- R2模擬環境でCharacter・Styleを同じ利用者だけへ復元し、別利用者へ混入しないことを確認
+- 学習済み成果物のメタデータ、推論重み、学習設定を保存し、教師画像・captionが既定では送信されないことを確認
+- 教師画像保存を明示的に有効化した場合の保存・復元と、破損重みのSHA-256拒否を確認
+- ローカルLoRAを指定したcloud owner keyへ公開し、対応する利用者だけが復元できる移行経路を確認
+- 変更Pythonファイルの構文、Compose設定、Docker buildが成功し、イメージに秘密情報ファイルとローカル出力が含まれないことを確認
 
 ### 実機で残った制約
 
@@ -318,20 +325,25 @@ Node.jsが実行コンテナにない場合は、Nodeを含む既存ビルド環
 
 2026-07-31の最終確認では、自動テスト57件、`app.py`・`prompt_refiner.py`・`sdxl_janku_workflow.py` のPython構文、Docker build、`git diff --check` が成功した。実行環境にNode.jsがないため `node --check static/app.js` は未実施だが、実ブラウザで複数生成・履歴復元まで操作し、コンソールエラー0件を確認した。T-017では画像36・caption 36・欠落0・空caption 0、Zeroの両CLIP tokenizerで77トークン超過0、dry-run、720ステップ学習、LoRA smoke load、5条件の実GPU比較も確認済み。2026-08-03のVast現行モデル限定化後も自動テスト57件、主要Python 5ファイルとBashの構文、Compose設定、Docker buildが成功し、ビルド済みイメージに `docs/KEYS.md` と `output/` が含まれないことを確認した。
 
+2026-08-03のT-020ローカル確認では、ユーザー別R2同期を含む自動テスト63件、変更Pythonファイルの構文、Compose設定、Docker buildが成功した。ビルド済みイメージに同期コードと移行CLIが含まれ、`docs/KEYS.md` と `output/` が含まれないことも確認した。実R2とVast.aiのend-to-endは未実施。
+
 ## 10. 次に行うこと
 
-次のチャットではT-017を続け、暫定720をそのまま合格扱いにせず、次の順で進める。
+T-020のネット反映と実R2確認を先に行い、その後にT-017を次の順で続ける。
 
 1. `AGENTS.md`、この文書、`PROJECT_STATUS.md`、`TASKS.md`、`DECISIONS.md`を読む
-2. `output/t017-zero-lora/EVALUATION_SUMMARY.md` と5つの比較フォルダを確認する
-3. 正面では後頭部のお団子を固定人物定義へ常時入れず、背面・斜め向きでは指定する視点依存の扱いを設計する
-4. 体格教師画像とお団子教師画像の比率、caption、repeat数を見直す。正本36枚を上書きせず、再学習案ごとにステージングを分ける
-5. rank 16、解像度768、学習率 `1e-4`、左右反転なしを基準に再学習し、200ステップごとの比較重みを保存する
-6. 正面、左右斜め、背面、全身、別衣装・別背景を複数seedで比較する
-7. Rose Crimsonの瞳、顔、後頭部中央のお団子、猫型髪飾り、小柄な全身比率、可変衣装・背景追従を単一checkpointで満たす場合だけCharacter LoRAを採用する
-8. Character LoRA合格後に、同じ画風で別人物・別背景・複数構図を含む50枚以上からStyle LoRAを学習する
+2. T-020のcommit、GitHub push、新しいSHA固定Dockerイメージ公開を確認する
+3. Cloudflare Access経由の `GET /api/lora/models` からowner keyを確認し、現在のZero LoRAをそのownerへ移行する
+4. Vast.aiでLoRA一覧への復元と選択生成を確認する
+5. `output/t017-zero-lora/EVALUATION_SUMMARY.md` と5つの比較フォルダを確認する
+6. 正面では後頭部のお団子を固定人物定義へ常時入れず、背面・斜め向きでは指定する視点依存の扱いを設計する
+7. 体格教師画像とお団子教師画像の比率、caption、repeat数を見直す。正本36枚を上書きせず、再学習案ごとにステージングを分ける
+8. rank 16、解像度768、学習率 `1e-4`、左右反転なしを基準に再学習し、200ステップごとの比較重みを保存する
+9. 正面、左右斜め、背面、全身、別衣装・別背景を複数seedで比較する
+10. Rose Crimsonの瞳、顔、後頭部中央のお団子、猫型髪飾り、小柄な全身比率、可変衣装・背景追従を単一checkpointで満たす場合だけCharacter LoRAを採用する
+11. Character LoRA合格後に、同じ画風で別人物・別背景・複数構図を含む50枚以上からStyle LoRAを学習する
 
-Character LoRAの評価後に、Style LoRA用50枚以上、T-015のOpenPose、Vast.aiとCloudflareのend-to-endへ進む。T-018とT-019は完了済み。
+ユーザー別LoRA R2同期のGitHub反映、Vast.ai実R2確認を先に完了し、その後にCharacter LoRA評価、Style LoRA用50枚以上、T-015のOpenPoseへ進む。T-018とT-019は完了済み、T-020はローカル実装・模擬テスト・Docker build済みでend-to-end待ち。
 
 ## 11. Gitとデプロイ
 
@@ -343,7 +355,7 @@ Character LoRAの評価後に、Style LoRA用50枚以上、T-015のOpenPose、Va
 - Vast.ai用Docker Hubタグは `nukota0615/hidream-o1-image:c8233dcaba06d4cf180bd31e9bc8006b191faf34`
 - 公開digestは `sha256:f9f6df2467bb58725f677005c19a957a61aac98ac79cc2be184a64a1ab3ab44b`、platformは `linux/amd64`
 - GHCRはローカル認証切れのため同タグ未公開。Vast.aiではDocker Hubタグを使用する
-- Vast.aiインスタンスは未契約。2026-08-03にローカルのRTX 5090・約32GB VRAM相当の構成選定を再開し、Vast.aiのログイン・残高確認を待っている
+- Vast.aiは最初のホストでcontainer layer展開に失敗したが、別ホストへ変更後に現行公開イメージの起動と通常イラスト生成に成功した
 - 2026-08-03に新しいCloudflareアカウントAPIトークンがactiveであり、Worker、R2、D1の読み取りに成功した
 - 新しいR2 S3認証で画像バケットとモデルキャッシュの読み取りに成功した。S3 endpointはCloudflare公式のアカウントID形式を使用する
 - 既存WorkerのR2・D1・Access・Backend bindingとD1テーブルを確認したが、デプロイは2026-07-22のままである
@@ -351,6 +363,8 @@ Character LoRAの評価後に、Style LoRA用50枚以上、T-015のOpenPose、Va
 - 検証用のCloudflare APIトークンとR2 S3キーは本番稼働前にローテーションする。値はGit・文書へ保存しない
 - 2026-08-03にVast.aiテンプレートとCloudflare環境変数の設定が完了し、現在使用中の3モデル系統だけを準備する起動構成へソースと環境変数例を変更した。新しいSHA固定イメージのVast実機起動はユーザーが行う
 - 現行モデル限定イメージは `nukota0615/hidream-o1-image:4b7d43c33ce7452cd4a7cb9e6da90011d9d6840f`。リモートdigestは `sha256:14ef1788ac1b8dcc632906e065cd60274248e0114a8a918be8319865ca053df5`、実行platformは `linux/amd64`
+- 上記イメージは別のVastホストで起動と通常イラスト生成に成功した。参照生成は未確認
+- T-020のユーザー別LoRA R2同期はまだローカル変更であり、GitHub・Docker Hub・実R2へ未反映
 - `input/` はGit管理外。教師画像36枚はローカルにだけ存在する
 - `output/t017-zero-lora/` はGitへ未追加。比較画像と評価記録は現在ローカルにだけ存在する
 - T-017のcaption・ステージング・比較画像はローカル資産として維持し、T-018とT-019のソース・テスト・管理文書はこのブランチへcommit・pushする
