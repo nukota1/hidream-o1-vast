@@ -146,8 +146,9 @@
   - 現在のZero Character LoRAをR2の `local` ownerへ推論重みと学習設定の2成果物、93,065,511 bytesとして保存した
   - 中間checkpoint 4件を未参照成果物としてR2から整理し、cleanup error 0件を確認した
   - 空の一時ストアへR2から1モデルを復元し、サイズ・SHA-256検証とメタデータ登録に成功した
+  - checkpoint除外修正コミット `9b1f096ce4ca5ad4e54871bba7b095f603b41479` をGitHubへpushした
+  - 同コミットのDocker Hubイメージを公開し、リモートdigest `sha256:196e8377cf1a5ad0969ec042b74a086a03087ad9759e241203a1980363915f02` と `linux/amd64` manifestを確認した
 - 残作業:
-  - checkpoint除外修正をcommit・GitHubへpushし、新しいSHA固定Dockerイメージを公開する
   - Cloudflare Access経由のowner keyへ現在のZero Character LoRAを移行し、Vast.aiで復元・生成を確認する
 
 ### T-015 OpenPose ControlNetによる厳密なポーズ制御

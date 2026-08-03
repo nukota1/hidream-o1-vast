@@ -333,18 +333,17 @@ Node.jsが実行コンテナにない場合は、Nodeを含む既存ビルド環
 T-020のネット反映と実R2確認を先に行い、その後にT-017を次の順で続ける。
 
 1. `AGENTS.md`、この文書、`PROJECT_STATUS.md`、`TASKS.md`、`DECISIONS.md`を読む
-2. T-020のcommit、GitHub push、新しいSHA固定Dockerイメージ公開を確認する
-3. Cloudflare Access経由の `GET /api/lora/models` からowner keyを確認し、現在のZero LoRAをそのownerへ移行する
-4. Vast.aiでLoRA一覧への復元と選択生成を確認する
-5. `output/t017-zero-lora/EVALUATION_SUMMARY.md` と5つの比較フォルダを確認する
-6. 正面では後頭部のお団子を固定人物定義へ常時入れず、背面・斜め向きでは指定する視点依存の扱いを設計する
-7. 体格教師画像とお団子教師画像の比率、caption、repeat数を見直す。正本36枚を上書きせず、再学習案ごとにステージングを分ける
-8. rank 16、解像度768、学習率 `1e-4`、左右反転なしを基準に再学習し、200ステップごとの比較重みを保存する
-9. 正面、左右斜め、背面、全身、別衣装・別背景を複数seedで比較する
-10. Rose Crimsonの瞳、顔、後頭部中央のお団子、猫型髪飾り、小柄な全身比率、可変衣装・背景追従を単一checkpointで満たす場合だけCharacter LoRAを採用する
-11. Character LoRA合格後に、同じ画風で別人物・別背景・複数構図を含む50枚以上からStyle LoRAを学習する
+2. Cloudflare Access経由の `GET /api/lora/models` からowner keyを確認し、現在のZero LoRAをそのownerへ移行する
+3. Vast.aiでLoRA一覧への復元と選択生成を確認する
+4. `output/t017-zero-lora/EVALUATION_SUMMARY.md` と5つの比較フォルダを確認する
+5. 正面では後頭部のお団子を固定人物定義へ常時入れず、背面・斜め向きでは指定する視点依存の扱いを設計する
+6. 体格教師画像とお団子教師画像の比率、caption、repeat数を見直す。正本36枚を上書きせず、再学習案ごとにステージングを分ける
+7. rank 16、解像度768、学習率 `1e-4`、左右反転なしを基準に再学習し、200ステップごとの比較重みを保存する
+8. 正面、左右斜め、背面、全身、別衣装・別背景を複数seedで比較する
+9. Rose Crimsonの瞳、顔、後頭部中央のお団子、猫型髪飾り、小柄な全身比率、可変衣装・背景追従を単一checkpointで満たす場合だけCharacter LoRAを採用する
+10. Character LoRA合格後に、同じ画風で別人物・別背景・複数構図を含む50枚以上からStyle LoRAを学習する
 
-ユーザー別LoRA R2同期のGitHub反映、Vast.ai実R2確認を先に完了し、その後にCharacter LoRA評価、Style LoRA用50枚以上、T-015のOpenPoseへ進む。T-018とT-019は完了済み、T-020はローカル実装・模擬テスト・Docker build済みでend-to-end待ち。
+Cloudflare Access利用者ownerへのLoRA移行とVast.ai復元・生成を先に完了し、その後にCharacter LoRA評価、Style LoRA用50枚以上、T-015のOpenPoseへ進む。T-018とT-019は完了済み、T-020はGitHub・Docker Hub公開と `local` ownerの実R2確認済みで、Access利用者のend-to-end待ち。
 
 ## 11. Gitとデプロイ
 
@@ -365,7 +364,9 @@ T-020のネット反映と実R2確認を先に行い、その後にT-017を次�
 - 2026-08-03にVast.aiテンプレートとCloudflare環境変数の設定が完了し、現在使用中の3モデル系統だけを準備する起動構成へソースと環境変数例を変更した。新しいSHA固定イメージのVast実機起動はユーザーが行う
 - 現行モデル限定イメージは `nukota0615/hidream-o1-image:4b7d43c33ce7452cd4a7cb9e6da90011d9d6840f`。リモートdigestは `sha256:14ef1788ac1b8dcc632906e065cd60274248e0114a8a918be8319865ca053df5`、実行platformは `linux/amd64`
 - 上記イメージは別のVastホストで起動と通常イラスト生成に成功した。参照生成は未確認
-- T-020のユーザー別LoRA R2同期はまだローカル変更であり、GitHub・Docker Hub・実R2へ未反映
+- T-020のユーザー別LoRA R2同期とcheckpoint除外修正は `9b1f096ce4ca5ad4e54871bba7b095f603b41479` としてGitHubへpush済み
+- 同コミットのDocker Hubタグは `nukota0615/hidream-o1-image:9b1f096ce4ca5ad4e54871bba7b095f603b41479`、リモートdigestは `sha256:196e8377cf1a5ad0969ec042b74a086a03087ad9759e241203a1980363915f02`、実行platformは `linux/amd64`
+- 現在のZero LoRAはR2の `local` ownerへ保存・一時復元済み。Cloudflare Access利用者ownerへの移行とVast.ai生成は未実施
 - `input/` はGit管理外。教師画像36枚はローカルにだけ存在する
 - `output/t017-zero-lora/` はGitへ未追加。比較画像と評価記録は現在ローカルにだけ存在する
 - T-017のcaption・ステージング・比較画像はローカル資産として維持し、T-018とT-019のソース・テスト・管理文書はこのブランチへcommit・pushする

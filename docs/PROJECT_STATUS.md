@@ -125,6 +125,8 @@
 - ビルド済みイメージにR2同期コードが入り、`docs/KEYS.md` と `output/` が含まれないことを確認
 - 現在のZero Character LoRAをR2の `local` ownerへ推論重みと学習設定の2成果物、93,065,511 bytesとして保存
 - 比較用中間checkpoint 4件を未参照成果物としてR2から整理し、空の一時ストアへ1モデルを復元してサイズ・SHA-256検証に成功
+- checkpoint除外修正コミット `9b1f096ce4ca5ad4e54871bba7b095f603b41479` をGitHubとDocker Hubへ公開
+- 公開イメージのdigest `sha256:196e8377cf1a5ad0969ec042b74a086a03087ad9759e241203a1980363915f02` と `linux/amd64` manifestをリモート確認
 
 ## 既知の制約
 
@@ -154,13 +156,12 @@
 
 ## 次の優先作業
 
-1. ユーザー別LoRA R2同期をGitHubと新しいSHA固定イメージへ反映する（T-020）
-2. Cloudflare Access利用者のowner keyへ現在のZero LoRAを移行し、Vast.aiで復元・生成を確認する（T-020）
-3. 正面では後頭部のお団子を常時挿入しない視点依存の人物固定定義を検討する（T-017）
-4. 体格・お団子教師画像の比率、caption、repeat数を見直してZero用Character LoRAを再学習する（T-017）
-5. 複数seed・複数視点でRose Crimsonの瞳、顔、後頭部中央のお団子、身長比率、衣装・背景追従性を再評価する（T-017）
-6. 同じ画風で別人物・別背景・複数構図を含む50枚以上からStyle LoRAを学習する（T-017）
-7. OpenPose ControlNetとポーズ参照入力を実装し、手指を含むポーズ追従性を高める（T-015）
+1. Cloudflare Access利用者のowner keyへ現在のZero LoRAを移行し、Vast.aiで復元・生成を確認する（T-020）
+2. 正面では後頭部のお団子を常時挿入しない視点依存の人物固定定義を検討する（T-017）
+3. 体格・お団子教師画像の比率、caption、repeat数を見直してZero用Character LoRAを再学習する（T-017）
+4. 複数seed・複数視点でRose Crimsonの瞳、顔、後頭部中央のお団子、身長比率、衣装・背景追従性を再評価する（T-017）
+5. 同じ画風で別人物・別背景・複数構図を含む50枚以上からStyle LoRAを学習する（T-017）
+6. OpenPose ControlNetとポーズ参照入力を実装し、手指を含むポーズ追従性を高める（T-015）
 
 ## 開発環境
 
