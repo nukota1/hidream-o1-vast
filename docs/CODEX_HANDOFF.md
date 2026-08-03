@@ -230,7 +230,7 @@ LoRAはポーズを固定する機能ではない。テキストとIP-Adapterだ
 
 ## 8. 2026-07-28〜31の確認結果
 
-- 既存フロー、Zero・複数LoRA、prompt優先制御、逐次複数生成、画風履歴、ユーザー別R2同期を含む自動テスト63件成功
+- 既存フロー、Zero・複数LoRA、prompt優先制御、逐次複数生成、画風履歴、ユーザー別R2同期を含む自動テスト64件成功
 - Python、JavaScript、Bashの構文確認成功
 - Docker Compose設定確認とDockerイメージビルド成功
 - ローカルUIでZero表示、Character・Styleの別セレクタ、Style学習時の人物固定項目非表示を確認
@@ -293,6 +293,7 @@ LoRAはポーズを固定する機能ではない。テキストとIP-Adapterだ
 - 学習済み成果物のメタデータ、推論重み、学習設定を保存し、教師画像・captionが既定では送信されないことを確認
 - 教師画像保存を明示的に有効化した場合の保存・復元と、破損重みのSHA-256拒否を確認
 - ローカルLoRAを指定したcloud owner keyへ公開し、対応する利用者だけが復元できる移行経路を確認
+- 推論に不要な中間checkpointを既定で除外し、再公開時に参照されなくなった同一モデルのR2成果物を整理することを確認
 - 変更Pythonファイルの構文、Compose設定、Docker buildが成功し、イメージに秘密情報ファイルとローカル出力が含まれないことを確認
 
 ### 実機で残った制約
@@ -325,7 +326,7 @@ Node.jsが実行コンテナにない場合は、Nodeを含む既存ビルド環
 
 2026-07-31の最終確認では、自動テスト57件、`app.py`・`prompt_refiner.py`・`sdxl_janku_workflow.py` のPython構文、Docker build、`git diff --check` が成功した。実行環境にNode.jsがないため `node --check static/app.js` は未実施だが、実ブラウザで複数生成・履歴復元まで操作し、コンソールエラー0件を確認した。T-017では画像36・caption 36・欠落0・空caption 0、Zeroの両CLIP tokenizerで77トークン超過0、dry-run、720ステップ学習、LoRA smoke load、5条件の実GPU比較も確認済み。2026-08-03のVast現行モデル限定化後も自動テスト57件、主要Python 5ファイルとBashの構文、Compose設定、Docker buildが成功し、ビルド済みイメージに `docs/KEYS.md` と `output/` が含まれないことを確認した。
 
-2026-08-03のT-020ローカル確認では、ユーザー別R2同期を含む自動テスト63件、変更Pythonファイルの構文、Compose設定、Docker buildが成功した。ビルド済みイメージに同期コードと移行CLIが含まれ、`docs/KEYS.md` と `output/` が含まれないことも確認した。実R2とVast.aiのend-to-endは未実施。
+2026-08-03のT-020確認では、ユーザー別R2同期を含む自動テスト64件、変更Pythonファイルの構文、Compose設定、Docker buildが成功した。ビルド済みイメージに同期コードと移行CLIが含まれ、`docs/KEYS.md` と `output/` が含まれないことも確認した。現在のZero Character LoRAはR2の `local` ownerへ推論重みと学習設定の2成果物、93,065,511 bytesとして保存し、中間checkpoint 4件を整理した。空の一時ストアへ1モデルを復元し、サイズ・SHA-256検証にも成功した。Cloudflare Access利用者ownerとVast.aiを使う復元・生成は未実施。
 
 ## 10. 次に行うこと
 

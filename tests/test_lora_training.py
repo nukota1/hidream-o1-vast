@@ -65,6 +65,11 @@ class FakeR2Client:
         ]
         return {"Contents": contents, "IsTruncated": False}
 
+    def delete_objects(self, *, Bucket, Delete):
+        for item in Delete.get("Objects") or []:
+            self.objects.pop((Bucket, item["Key"]), None)
+        return {"Deleted": Delete.get("Objects") or []}
+
 
 class LoraTrainingTests(unittest.TestCase):
     zero_environment = {
@@ -224,6 +229,12 @@ class LoraTrainingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = LoraStore(directory)
             model = self.create_ready_model(store, "google-user-123")
+            checkpoint = store.output_path(
+                "google-user-123",
+                model["id"],
+            ) / "checkpoint-100"
+            checkpoint.mkdir()
+            (checkpoint / "pytorch_lora_weights.safetensors").write_bytes(b"checkpoint")
             client = FakeR2Client()
             sync = LoraR2Sync(
                 store,
@@ -240,11 +251,37 @@ class LoraTrainingTests(unittest.TestCase):
             self.assertTrue(any(key.endswith("/metadata.json") for key in keys))
             self.assertTrue(any(key.endswith("/pytorch_lora_weights.safetensors") for key in keys))
             self.assertTrue(any(key.endswith("/training.json") for key in keys))
+            self.assertFalse(any("/checkpoint-100/" in key for key in keys))
             self.assertFalse(any("/dataset/" in key for key in keys))
             metadata_key = next(key for key in keys if key.endswith("/metadata.json"))
             remote_metadata = json.loads(client.objects[("model-cache", metadata_key)])
             self.assertNotIn("captions", remote_metadata)
             self.assertNotIn("remote_storage", store.public(store.read("google-user-123", model["id"])))
+
+    def test_r2_republish_prunes_unreferenced_checkpoints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = LoraStore(directory)
+            model = self.create_ready_model(store, "owner-a")
+            checkpoint = store.output_path("owner-a", model["id"]) / "checkpoint-100"
+            checkpoint.mkdir()
+            (checkpoint / "pytorch_lora_weights.safetensors").write_bytes(b"checkpoint")
+            client = FakeR2Client()
+            sync = LoraR2Sync(
+                store,
+                enabled=True,
+                bucket="model-cache",
+                include_checkpoints=True,
+                client=client,
+            )
+            sync.publish_model("owner-a", model["id"])
+            self.assertTrue(any("/checkpoint-100/" in key for _, key in client.objects))
+
+            sync.include_checkpoints = False
+            result = sync.publish_model("owner-a", model["id"])
+
+            self.assertEqual(result["deleted"], 1)
+            self.assertEqual(result["cleanup_errors"], [])
+            self.assertFalse(any("/checkpoint-100/" in key for _, key in client.objects))
 
     def test_r2_sync_restores_character_and_style_for_only_the_requested_owner(self):
         client = FakeR2Client()

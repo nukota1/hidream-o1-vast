@@ -120,9 +120,11 @@
 - 現行モデル限定コミット `4b7d43c33ce7452cd4a7cb9e6da90011d9d6840f` のVast.ai用イメージをDocker Hubへ公開
 - 公開タグ `nukota0615/hidream-o1-image:4b7d43c33ce7452cd4a7cb9e6da90011d9d6840f`、digest `sha256:14ef1788ac1b8dcc632906e065cd60274248e0114a8a918be8319865ca053df5`、実行platform `linux/amd64` をリモート確認
 - Vast.aiの最初のホストではコンテナlayer展開が失敗したが、別ホストへ変更後はアプリ起動と通常イラスト生成に成功
-- ユーザー別LoRA R2同期の模擬テストを追加し、Character・Style復元、ユーザー分離、ローカルからcloud ownerへの移行、教師画像opt-in、破損重み拒否を含む自動テスト63件が成功
+- ユーザー別LoRA R2同期の模擬テストを追加し、Character・Style復元、ユーザー分離、ローカルからcloud ownerへの移行、教師画像opt-in、中間checkpoint除外・整理、破損重み拒否を含む自動テスト64件が成功
 - R2同期を含む変更Pythonファイルの構文、Compose設定、Docker buildが成功
 - ビルド済みイメージにR2同期コードが入り、`docs/KEYS.md` と `output/` が含まれないことを確認
+- 現在のZero Character LoRAをR2の `local` ownerへ推論重みと学習設定の2成果物、93,065,511 bytesとして保存
+- 比較用中間checkpoint 4件を未参照成果物としてR2から整理し、空の一時ストアへ1モデルを復元してサイズ・SHA-256検証に成功
 
 ## 既知の制約
 
@@ -146,7 +148,7 @@
 - Cloudflareの検証用認証は利用可能。本番稼働前にAPIトークンとR2 S3キーをローテーションする
 - 現在デプロイ済みの `BACKEND_SHARED_SECRET` bindingは `plain_text` のため、次回Workerデプロイ時にWorker Secretへ置き換える
 - 現在のZero用Character LoRAはGit・公開Dockerイメージに含まれない。R2移行コードはローカル実装済みだが、Cloudflare Access利用者のowner keyへの実データ移行は未実施
-- ユーザー別LoRA R2同期はローカル模擬テスト済みだが、実R2・Vast.aiを使うend-to-end確認、LoRA削除、保存期間管理、複数Vast間の同時学習排他は未実施
+- ユーザー別LoRA R2同期は `local` ownerの実R2アップロード・復元まで確認済みだが、Cloudflare Access利用者ownerとVast.aiを使うend-to-end確認、LoRA削除、保存期間管理、複数Vast間の同時学習排他は未実施
 - Vast.ai側でPython/CUDA依存を永続ディスクへ保存するか、依存込みイメージとの起動時間・転送量を比較する必要がある
 - 旧クロマ・人物抽出コードは既存資産と手動処理の互換用に残っているが、標準UIからは実行しない
 

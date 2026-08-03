@@ -54,7 +54,8 @@ training and lazily restores only that user's assets when the LoRA list or a
 generation request needs them. `/models/loras` remains a local cache.
 
 The default remote objects are `metadata.json`, the inference weights, and the
-small training configuration. Raw source images and captions remain local unless
+small training configuration. Intermediate checkpoints are also excluded unless
+`LORA_R2_INCLUDE_CHECKPOINTS=1` is selected. Raw source images and captions remain local unless
 `LORA_R2_INCLUDE_TRAINING_DATA=1` is explicitly selected. Use the matching
 restore flag only when retraining data must be recovered on a new instance.
 

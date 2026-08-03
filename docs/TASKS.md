@@ -129,6 +129,7 @@
   - LoRA一覧と生成時に要求された利用者だけを遅延同期し、サイズとSHA-256を検証して `/models/loras` へ復元する
   - Character、Style、Pose、Backgroundを共通形式で保存し、基盤モデルprofileの互換性判定は既存処理を維持する
   - 教師画像とcaptionのバックアップは環境変数による明示的なopt-inにする
+  - 推論に不要な中間checkpointは既定で除外し、再公開で参照されなくなった同一モデルのR2成果物を整理する
   - 既存ローカルLoRAを同一ownerまたは指定したremote owner keyへ移行するCLIを追加する
 - 完了条件:
   - 別ユーザーのLoRAが一覧・同期・生成対象へ混ざらない
@@ -139,11 +140,14 @@
   - GitHubと新しいSHA固定Dockerイメージへ反映し、Vast.aiでユーザー別R2同期をend-to-end確認する
 - 2026-08-03 ローカル実装・確認:
   - ユーザー別R2同期、学習後アップロード、遅延復元、チェックサム検証、任意の教師画像保存、移行CLIを実装した
-  - R2を模擬したCharacter・Style復元、ユーザー分離、ローカルからcloud ownerへの移行、教師画像opt-in、破損拒否を含む自動テスト63件が成功した
+  - R2を模擬したCharacter・Style復元、ユーザー分離、ローカルからcloud ownerへの移行、教師画像opt-in、中間checkpoint除外・整理、破損拒否を含む自動テスト64件が成功した
   - 変更Pythonファイルの構文、Compose設定、Docker buildが成功した
   - ビルド済みイメージにR2同期コードが入り、`docs/KEYS.md` と `output/` が含まれないことを確認した
+  - 現在のZero Character LoRAをR2の `local` ownerへ推論重みと学習設定の2成果物、93,065,511 bytesとして保存した
+  - 中間checkpoint 4件を未参照成果物としてR2から整理し、cleanup error 0件を確認した
+  - 空の一時ストアへR2から1モデルを復元し、サイズ・SHA-256検証とメタデータ登録に成功した
 - 残作業:
-  - 変更をcommit・GitHubへpushし、新しいSHA固定Dockerイメージを公開する
+  - checkpoint除外修正をcommit・GitHubへpushし、新しいSHA固定Dockerイメージを公開する
   - Cloudflare Access経由のowner keyへ現在のZero Character LoRAを移行し、Vast.aiで復元・生成を確認する
 
 ### T-015 OpenPose ControlNetによる厳密なポーズ制御

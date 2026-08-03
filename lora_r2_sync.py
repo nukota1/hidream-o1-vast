@@ -79,6 +79,7 @@ class LoraR2Sync:
         access_key_id="",
         secret_access_key="",
         upload_after_training=True,
+        include_checkpoints=False,
         include_training_data=False,
         restore_training_data=False,
         sync_interval_seconds=60,
@@ -93,6 +94,7 @@ class LoraR2Sync:
         self.access_key_id = str(access_key_id or "").strip()
         self.secret_access_key = str(secret_access_key or "").strip()
         self.upload_after_training = bool(upload_after_training)
+        self.include_checkpoints = bool(include_checkpoints)
         self.include_training_data = bool(include_training_data)
         self.restore_training_data = bool(restore_training_data)
         self.sync_interval_seconds = max(0, int(sync_interval_seconds))
@@ -124,6 +126,7 @@ class LoraR2Sync:
             access_key_id=access_key_id,
             secret_access_key=secret_access_key,
             upload_after_training=env_flag("LORA_R2_UPLOAD_AFTER_TRAINING", True),
+            include_checkpoints=env_flag("LORA_R2_INCLUDE_CHECKPOINTS"),
             include_training_data=env_flag("LORA_R2_INCLUDE_TRAINING_DATA"),
             restore_training_data=env_flag("LORA_R2_RESTORE_TRAINING_DATA"),
             sync_interval_seconds=os.environ.get("LORA_R2_SYNC_INTERVAL_SECONDS", "60"),
@@ -149,6 +152,7 @@ class LoraR2Sync:
             "enabled": self.enabled,
             "configured": self.configured,
             "upload_after_training": self.upload_after_training,
+            "include_checkpoints": self.include_checkpoints,
             "owner_key": owner_storage_key(owner_id),
             "bucket": self.bucket if self.enabled else "",
             "prefix": self.prefix if self.enabled else "",
@@ -277,14 +281,24 @@ class LoraR2Sync:
         weight_path = self.store.weight_path(owner_id, model_id)
         if not weight_path.is_file() or weight_path.is_symlink():
             raise RuntimeError("Completed LoRA weight file is missing.")
-        roots = [model_root / "output"]
-        if self.include_training_data:
-            roots.append(model_root / "dataset")
         paths = []
-        for root in roots:
-            if not root.is_dir():
-                continue
-            for path in sorted(root.rglob("*")):
+        output_root = model_root / "output"
+        for path in sorted(output_root.iterdir()):
+            if path.is_file() and not path.is_symlink():
+                relative = PurePosixPath(path.relative_to(model_root).as_posix())
+                safe_artifact_path(relative)
+                paths.append((path, relative))
+            elif self.include_checkpoints and path.is_dir() and path.name.startswith("checkpoint-"):
+                for checkpoint_path in sorted(path.rglob("*")):
+                    if checkpoint_path.is_file() and not checkpoint_path.is_symlink():
+                        relative = PurePosixPath(
+                            checkpoint_path.relative_to(model_root).as_posix()
+                        )
+                        safe_artifact_path(relative)
+                        paths.append((checkpoint_path, relative))
+        dataset_root = model_root / "dataset"
+        if self.include_training_data and dataset_root.is_dir():
+            for path in sorted(dataset_root.rglob("*")):
                 if path.is_file() and not path.is_symlink():
                     relative = PurePosixPath(path.relative_to(model_root).as_posix())
                     safe_artifact_path(relative)
@@ -346,11 +360,44 @@ class LoraR2Sync:
                 Body=json.dumps(remote_metadata, ensure_ascii=False, indent=2).encode("utf-8"),
                 ContentType="application/json; charset=utf-8",
             )
+            current_paths = {artifact["path"] for artifact in artifacts}
+            stale_keys = []
+            previous_storage = metadata.get("remote_storage")
+            if isinstance(previous_storage, dict):
+                for artifact in previous_storage.get("artifacts") or []:
+                    try:
+                        relative = safe_artifact_path(artifact.get("path"))
+                    except (AttributeError, ValueError):
+                        continue
+                    if relative.as_posix() not in current_paths:
+                        stale_keys.append(
+                            self._artifact_key(owner_key, model_id, relative)
+                        )
+            cleanup_errors = []
+            deleted = 0
+            if stale_keys:
+                try:
+                    response = client.delete_objects(
+                        Bucket=self.bucket,
+                        Delete={
+                            "Objects": [{"Key": key} for key in stale_keys],
+                            "Quiet": True,
+                        },
+                    )
+                    cleanup_errors = [
+                        str(item.get("Message") or item.get("Code") or "delete failed")[:500]
+                        for item in response.get("Errors") or []
+                    ]
+                    deleted = len(stale_keys) - len(cleanup_errors)
+                except Exception as exc:
+                    cleanup_errors = [str(exc)[:500]]
             self._last_sync[owner_key] = time.monotonic()
             return {
                 "status": "uploaded",
                 "uploaded": len(artifacts),
                 "bytes": total_bytes,
+                "deleted": deleted,
+                "cleanup_errors": cleanup_errors,
                 "owner_key": owner_key,
                 "model_id": model_id,
             }
